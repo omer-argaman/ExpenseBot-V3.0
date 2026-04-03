@@ -271,17 +271,30 @@ def format_monthly_report(prev_month_dt: datetime) -> tuple[str, object]:
     lines = [f"📅 <b>Monthly Summary — {prev_month_dt.strftime('%B %Y')}</b>\n"]
 
     for name, spent, budget, balance in sections:
-        emoji   = _section_emoji(name)
-        warning = " ⚠" if balance < 0 else ""
-        lines.append(
-            f"{emoji} <b>{name}</b>{warning}   {_fmt_amount(spent)} / {_fmt_amount(budget)}"
-        )
+        emoji = _section_emoji(name)
+        if budget > 0:
+            warning = " ⚠" if balance < 0 else ""
+            lines.append(
+                f"{emoji} <b>{name}</b>{warning}   {_fmt_amount(spent)} / {_fmt_amount(budget)}"
+            )
+        else:
+            lines.append(f"{emoji} <b>{name}</b>   {_fmt_amount(spent)}")
 
     lines.append("")
-    overall = "⚠️" if grand_balance < 0 else "✅"
-    lines.append(
-        f"💰 <b>Total   {_fmt_amount(grand_spent)} / {_fmt_amount(grand_budget)}</b>  {overall}"
-    )
+    # Only include sections with an actual budget in the budget comparison
+    budgeted_spent  = sum(s for _, s, b, _ in sections if b > 0)
+    budgeted_budget = sum(b for _, _, b, _ in sections if b > 0)
+    unbudgeted_spent = grand_spent - budgeted_spent
+
+    if budgeted_budget > 0:
+        overall = "⚠️" if budgeted_spent > budgeted_budget else "✅"
+        lines.append(
+            f"💰 <b>Total (budgeted)   {_fmt_amount(budgeted_spent)} / {_fmt_amount(budgeted_budget)}</b>  {overall}"
+        )
+        if unbudgeted_spent > 0:
+            lines.append(f"➕ <b>Unbudgeted spending   {_fmt_amount(unbudgeted_spent)}</b>")
+    else:
+        lines.append(f"💰 <b>Total spent   {_fmt_amount(grand_spent)}</b>")
 
     lines.append("")
     if anomalies:
