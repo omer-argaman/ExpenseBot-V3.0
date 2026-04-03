@@ -7,6 +7,9 @@ tg_handle_message()   — async Telegram handler, calls process_expense internal
 
 import logging
 import re
+import json
+import time
+import sys
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
@@ -17,6 +20,36 @@ from handlers.commands import append_to_history
 from handlers.subscribers import track_subscriber
 
 logger = logging.getLogger(__name__)
+
+# #region agent debug helpers
+_DBG_LOG = "/Users/omer/Desktop/Expences_Project/Parents/ExpenseBotParents-1/.cursor/debug-b7a257.log"
+
+def _mem_mb() -> float:
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS'):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except Exception:
+        pass
+    try:
+        import resource
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return round(rss / (1024 * 1024 if sys.platform == 'darwin' else 1024), 1)
+    except Exception:
+        return -1
+
+def _dbg(location: str, msg: str, hyp: str, **data):
+    try:
+        payload = {"sessionId": "b7a257", "timestamp": int(time.time() * 1000),
+                   "location": location, "message": msg, "hypothesisId": hyp,
+                   "data": {"mem_mb": _mem_mb(), **data}}
+        with open(_DBG_LOG, 'a') as f:
+            f.write(json.dumps(payload) + '\n')
+        logger.info(f"[DBG:{hyp}] {msg} mem={_mem_mb()}MB {data}")
+    except Exception:
+        pass
+# #endregion
 
 
 def process_expense(text: str) -> tuple[str, ParseResult]:
@@ -92,6 +125,16 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """
     track_subscriber(update.effective_chat.id)
     text = update.message.text.strip()
+
+    # #region agent debug - H-A/H-C: memory at handler entry
+    _mem_before = _mem_mb()
+    _dbg("message.py:tg_handle_message", "handler entry",
+         hyp="H-A",
+         user_data_keys=list(context.user_data.keys()),
+         all_users_count=len(context.application.user_data),
+         text_preview=text[:30])
+    # #endregion
+
     pending = context.user_data.get("pending")
 
     # ------------------------------------------------------------------
@@ -176,3 +219,12 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "Use /categories to browse, or /keywords &lt;name&gt; to check keywords.",
             parse_mode="HTML",
         )
+
+    # #region agent debug - H-C: did memory drop after full handler completes?
+    import gc as _gc
+    _gc.collect()
+    _dbg("message.py:tg_handle_message", "handler exit (after gc)",
+         hyp="H-C",
+         mem_before_mb=_mem_before,
+         delta_mb=round(_mem_mb() - _mem_before, 1))
+    # #endregion
