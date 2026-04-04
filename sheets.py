@@ -97,51 +97,12 @@ _service_cache = None
 def _build_service():
     global _service_cache
     if _service_cache is not None:
-        # #region agent debug - verify cache hit
-        import json as _json, time as _time, sys as _sys
-        _DBG = "/Users/omer/Desktop/Expences_Project/Parents/ExpenseBotParents-1/.cursor/debug-b7a257.log"
-        def _m():
-            try:
-                with open('/proc/self/status') as f:
-                    for l in f:
-                        if l.startswith('VmRSS'): return round(int(l.split()[1])/1024,1)
-            except Exception: pass
-            try:
-                import resource; rss=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                return round(rss/(1024*1024 if _sys.platform=='darwin' else 1024),1)
-            except Exception: return -1
-        try:
-            with open(_DBG,'a') as f: f.write(_json.dumps({"sessionId":"b7a257","timestamp":int(_time.time()*1000),"location":"sheets.py:_build_service","message":"cache hit — reusing service","hypothesisId":"FIX","data":{"mem_mb":_m()}})+'\n')
-        except Exception: pass
-        # #endregion
         return _service_cache
-
     if not GOOGLE_CREDENTIALS_JSON:
         raise EnvironmentError("GOOGLE_CREDENTIALS environment variable is not set.")
     creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
     creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-    # #region agent debug - verify first build cost
-    import gc, json as _json, time as _time, sys as _sys
-    _DBG = "/Users/omer/Desktop/Expences_Project/Parents/ExpenseBotParents-1/.cursor/debug-b7a257.log"
-    def _m():
-        try:
-            with open('/proc/self/status') as f:
-                for l in f:
-                    if l.startswith('VmRSS'): return round(int(l.split()[1])/1024,1)
-        except Exception: pass
-        try:
-            import resource; rss=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            return round(rss/(1024*1024 if _sys.platform=='darwin' else 1024),1)
-        except Exception: return -1
-    def _w(msg, **d):
-        try:
-            with open(_DBG,'a') as f: f.write(_json.dumps({"sessionId":"b7a257","timestamp":int(_time.time()*1000),"location":"sheets.py:_build_service","message":msg,"hypothesisId":"FIX","data":{"mem_mb":_m(),**d}})+'\n')
-        except Exception: pass
-    _pre = _m()
-    _w("first build() — before", stage="pre_build")
     _service_cache = build("sheets", "v4", credentials=creds)
-    _w("first build() — after", stage="post_build", delta_mb=round(_m()-_pre,1))
-    # #endregion
     return _service_cache
 
 
