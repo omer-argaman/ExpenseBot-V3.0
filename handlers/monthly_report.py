@@ -264,6 +264,7 @@ def format_monthly_report(prev_month_dt: datetime) -> tuple[str, object]:
         section_name: get_historical_spending(section_name, subcats, history_tab_data)
         for section_name, subcats in BROAD_CATEGORIES.items()
     }
+    del history_tab_data  # free the raw rows — no longer needed
 
     # ── 4. Detect anomalies & format ───────────────────────────────────────
     anomalies, months_available = detect_anomalies(sections, history_map)

@@ -2,19 +2,34 @@
 handlers/message.py — Free-text expense message processing.
 
 process_expense()     — pure sync logic, used by main.py test runner
-tg_handle_message()   — async Telegram handler, calls process_expense internally
+tg_handle_message()   — async Telegram handler
+
+Flow
+----
+1.  Run the rule-based parser first (free, instant).
+2.  If the parser is confident (matched / reversed) → log immediately.
+3.  Otherwise → hand off to the AI handler (ask_ai), which either:
+      a. calls log_expense via tool-use  →  log the expense
+      b. returns a short text reply       →  send it as-is
+
+Conversation history
+--------------------
+Per-user history is stored in context.user_data["ai_history"] as a plain list
+of {"role": "user"|"assistant", "content": str} dicts (OpenAI message format).
+The AI handler caps how far back it looks, so this list can grow indefinitely
+without ballooning prompt costs.
 """
 
 import logging
-import re
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update
 from telegram.ext import ContextTypes
 
 from parsing.parser import parse, ParseResult
 from sheets import log_expense
 from handlers.commands import append_to_history
 from handlers.subscribers import track_subscriber
+from handlers.ai_handler import ask_ai
 
 logger = logging.getLogger(__name__)
 
@@ -22,20 +37,20 @@ logger = logging.getLogger(__name__)
 def process_expense(text: str) -> tuple[str, ParseResult]:
     """
     Parse and (if matched) log a free-text expense message.
+    Used by main.py CLI test runner — no AI involved here.
 
     Returns:
         (reply, result) where reply is the string to send the user
-        and result is the ParseResult (useful for callers that want more detail).
+        and result is the ParseResult.
     """
     result = parse(text)
 
-    if result.status == "matched" or result.status == "reversed":
+    if result.status in ("matched", "reversed"):
         log_result = log_expense(
             category=result.category,
             amount=result.amount,
             original_text=result.original_text,
         )
-
         if log_result.success:
             append_to_history(
                 category=log_result.category,
@@ -76,44 +91,48 @@ def process_expense(text: str) -> tuple[str, ParseResult]:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _add_to_ai_history(context: ContextTypes.DEFAULT_TYPE, role: str, content: str) -> None:
+    """Append a message to the per-user AI conversation history."""
+    history: list = context.user_data.setdefault("ai_history", [])
+    history.append({"role": role, "content": content})
+
+
+def _get_ai_history(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
+    return context.user_data.get("ai_history", [])
+
+
+# ---------------------------------------------------------------------------
 # Telegram handler
 # ---------------------------------------------------------------------------
 
 async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Main Telegram entry point for free-text messages.
+    Main Telegram entry point for all free-text messages.
 
-    Checks for a pending conversation state first (ask_amount flow).
-    Otherwise parses the message normally and handles each status:
-      matched / reversed  → log and confirm
-      ask_amount          → ask for the amount, store state
-      fuzzy_confirm       → send inline Yes / No buttons, store state
-      no_match            → send error hint
+    Fast path  — parser returns matched / reversed:
+        Log immediately, no AI call, instant response.
+
+    AI path — everything else (no_match, ask_amount, fuzzy_confirm):
+        Pass message + per-user conversation history to ask_ai().
+        If AI picks a category + amount → log it.
+        If AI replies with text → send it (e.g. asking for the amount).
     """
     track_subscriber(update.effective_chat.id)
     text = update.message.text.strip()
-    pending = context.user_data.get("pending")
+
+    result = parse(text)
 
     # ------------------------------------------------------------------
-    # Resume a pending ask_amount conversation
+    # Fast path — rule-based parser is confident
     # ------------------------------------------------------------------
-    if pending and pending["type"] == "ask_amount":
-        m = re.search(r"-?\d+(?:\.\d+)?", text)
-        if not m:
-            await update.message.reply_text(
-                "I need a number. How much was it?", parse_mode="HTML"
-            )
-            return
-
-        amount   = float(m.group())
-        category = pending["category"]
-        original = pending["original_text"]
-        context.user_data.pop("pending", None)
-
+    if result.status in ("matched", "reversed"):
         log_result = log_expense(
-            category=category,
-            amount=amount,
-            original_text=original,
+            category=result.category,
+            amount=result.amount,
+            original_text=result.original_text,
         )
         if log_result.success:
             append_to_history(
@@ -122,11 +141,12 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 tab_name=log_result.tab_name,
                 row=log_result.row,
                 timestamp=log_result.timestamp,
-                original_text=original,
+                original_text=result.original_text,
             )
-            await update.message.reply_text(
-                f"<b>{log_result.message}</b>", parse_mode="HTML"
-            )
+            # Keep AI history in sync so follow-up messages have context
+            _add_to_ai_history(context, "user", text)
+            _add_to_ai_history(context, "assistant", log_result.message)
+            await update.message.reply_text(f"<b>{log_result.message}</b>", parse_mode="HTML")
         else:
             await update.message.reply_text(
                 f"❌ Sheet error: {log_result.message}", parse_mode="HTML"
@@ -134,45 +154,39 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     # ------------------------------------------------------------------
-    # Normal message — parse and act (single call to process_expense)
+    # AI path — parser is uncertain or has no match
     # ------------------------------------------------------------------
-    reply, result = process_expense(text)
+    history = _get_ai_history(context)
+    ai_result = await ask_ai(text, history)
 
-    if result.status in ("matched", "reversed"):
-        await update.message.reply_text(f"<b>{reply}</b>", parse_mode="HTML")
+    if ai_result["action"] == "log":
+        category = ai_result["category"]
+        amount   = ai_result["amount"]
 
-    elif result.status == "ask_amount":
-        context.user_data["pending"] = {
-            "type": "ask_amount",
-            "category": result.category,
-            "original_text": text,
-        }
-        await update.message.reply_text(
-            f"I recognise <b>{result.category}</b> but there's no amount.\n"
-            f"How much was it?",
-            parse_mode="HTML",
+        log_result = log_expense(
+            category=category,
+            amount=amount,
+            original_text=text,
         )
-
-    elif result.status == "fuzzy_confirm":
-        context.user_data["pending"] = {
-            "type": "fuzzy_confirm",
-            "suggestion": result.suggestion,
-            "amount": result.amount,
-            "original_text": text,
-        }
-        if result.amount is not None:
-            msg = f"Did you mean <b>{result.suggestion}</b>? (₪{result.amount:g})"
+        if log_result.success:
+            append_to_history(
+                category=log_result.category,
+                amount=log_result.amount_added,
+                tab_name=log_result.tab_name,
+                row=log_result.row,
+                timestamp=log_result.timestamp,
+                original_text=text,
+            )
+            _add_to_ai_history(context, "user", text)
+            _add_to_ai_history(context, "assistant", log_result.message)
+            await update.message.reply_text(f"<b>{log_result.message}</b>", parse_mode="HTML")
         else:
-            msg = f"Did you mean <b>{result.suggestion}</b>?"
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton(f"✅ Yes, {result.suggestion}", callback_data="fuzzy_yes"),
-            InlineKeyboardButton("❌ No",                        callback_data="fuzzy_no"),
-        ]])
-        await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="HTML")
+            await update.message.reply_text(
+                f"❌ Sheet error: {log_result.message}", parse_mode="HTML"
+            )
 
-    else:  # no_match
-        await update.message.reply_text(
-            "❌ I couldn't match that to any category.\n"
-            "Use /categories to browse, or /keywords &lt;name&gt; to check keywords.",
-            parse_mode="HTML",
-        )
+    else:  # action == "reply"
+        reply_text = ai_result["text"]
+        _add_to_ai_history(context, "user", text)
+        _add_to_ai_history(context, "assistant", reply_text)
+        await update.message.reply_text(reply_text, parse_mode="HTML")

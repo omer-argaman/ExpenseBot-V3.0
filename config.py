@@ -13,6 +13,9 @@ load_dotenv()
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+# OpenAI
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 # Google Sheets
 SPREADSHEET_ID          = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")
