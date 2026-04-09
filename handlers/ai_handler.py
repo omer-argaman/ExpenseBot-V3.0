@@ -7,11 +7,13 @@ ask_ai(user_message, history) -> dict
         {"action": "log_multiple","expenses": [{"category": str, "amount": float}, ...]}
         {"action": "delete",     "n": int}
         {"action": "reply",      "text": str}
+        {"action": "reply",      "text": str, "show_summary": {"month": int, "year": int}}
 
 Tools available to the AI:
     log_expense           — log one expense (caller handles the write)
     delete_expense        — delete/undo the last n expenses
-    get_monthly_summary   — full budget vs actuals for any month
+    show_summary          — display the interactive summary UI; data is also fed
+                            back to the AI so it can answer questions about it
     get_category_spending — budget + transaction history for one category
     get_all_transactions  — every logged transaction across ALL categories for a
                             month — enables emoji search, keyword search, full
@@ -67,18 +69,16 @@ def _build_system_prompt() -> str:
     return f"""You are a smart, concise expense-tracking assistant for a household \
 budget bot. Today is {now.strftime('%B %d, %Y')}.
 
-You have six capabilities:
+You have five capabilities:
 1. LOG expenses          → call log_expense for each expense you identify.
 2. DELETE/UNDO expenses  → call delete_expense when the user wants to remove a \
 recent entry.
-3. SHOW summary UI       → call show_summary when the user wants to VIEW the \
-budget overview screen.
-4. READ summary data     → call get_monthly_summary or compare_months when you \
-need numbers to answer a specific question internally.
-5. READ transaction data → call get_category_spending (one category) or \
+3. BUDGET SUMMARY        → call show_summary for anything involving the monthly \
+budget overview — whether the user wants to view it OR asks a question about it.
+4. READ transaction data → call get_category_spending (one category) or \
 get_all_transactions (everything) to see individual entries, search notes, \
 find specific items.
-6. ADVISE                → after reading data, give specific, number-backed \
+5. ADVISE                → after reading data, give specific, number-backed \
 recommendations.
 
 VALID CATEGORIES (use the exact name shown):
@@ -100,12 +100,20 @@ RULES — DELETING:
   "that was wrong", "I made a mistake", "no, remove that", "cancel", "oops". \
   Use n=1 unless the user specifies a different number.
 
+RULES — SUMMARY:
+- Call show_summary for ANY request involving the budget overview — "show me \
+  the summary", "how's my budget?", "am I over budget?", "give me \
+  recommendations", "budget overview", "show last month", etc.
+- After calling show_summary you will receive the data. Use it to answer the \
+  user's question if they asked one. If they only wanted to VIEW the summary \
+  (no specific question), return NO text — the interactive screen is enough.
+
 RULES — GENERAL:
 - Logging: call log_expense immediately — zero filler text alongside the call.
-- Questions about totals/budget: use get_monthly_summary or compare_months.
 - Questions about specific items, keywords, or entries (including emojis, names, \
   stores): use get_all_transactions.
 - Questions about one category: use get_category_spending.
+- Month comparisons: use compare_months.
 - Missing amount: ask in ONE sentence only.
 - Recommendations: reference real numbers.
 - Currency is Israeli Shekel (₪).
@@ -176,41 +184,13 @@ SHOW_SUMMARY_TOOL = {
     "function": {
         "name": "show_summary",
         "description": (
-            "Display the interactive budget summary to the user, with navigation "
-            "buttons to browse months and drill into sections. Call this when the "
-            "user wants to VIEW or OPEN the summary — e.g. 'show me the summary', "
-            "'open summary', 'budget overview', 'how's my budget looking?', "
-            "'show last month's budget', or any phrasing that means 'show me the "
-            "summary screen'. Use get_monthly_summary instead when you need to "
-            "READ the numbers internally to answer a specific question."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "month": {
-                    "type": "integer",
-                    "description": "Month 1–12. Omit for current month.",
-                },
-                "year": {
-                    "type": "integer",
-                    "description": "4-digit year. Omit for current year.",
-                },
-            },
-            "required": [],
-        },
-    },
-}
-
-GET_SUMMARY_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "get_monthly_summary",
-        "description": (
-            "Read the full budget vs actual spending breakdown for a given month "
-            "so you can reason about it and answer a specific question. Use for "
-            "questions like 'am I over budget?', 'how much did I spend in total?', "
-            "or when generating recommendations. Use show_summary instead if the "
-            "user simply wants to see the summary screen."
+            "Display the interactive budget summary UI to the user AND receive the "
+            "budget data so you can reason about it. Call this for ANY request "
+            "involving the monthly budget — whether the user wants to view it "
+            "('show me the summary', 'open summary', 'budget overview') or asks a "
+            "question about it ('am I over budget?', 'where should I cut costs?', "
+            "'how much did I spend in total?'). The data is returned to you; "
+            "only add a text response if the user asked a specific question."
         ),
         "parameters": {
             "type": "object",
@@ -315,7 +295,6 @@ ALL_TOOLS = [
     LOG_EXPENSE_TOOL,
     DELETE_EXPENSE_TOOL,
     SHOW_SUMMARY_TOOL,
-    GET_SUMMARY_TOOL,
     GET_CATEGORY_TOOL,
     GET_ALL_TRANSACTIONS_TOOL,
     COMPARE_MONTHS_TOOL,
@@ -438,10 +417,6 @@ async def _run_compare_months(
 
 async def _execute_tool(tool_name: str, args: dict) -> str:
     try:
-        if tool_name == "get_monthly_summary":
-            return await _run_get_monthly_summary(
-                month=args.get("month"), year=args.get("year")
-            )
         if tool_name == "get_category_spending":
             return await _run_get_category_spending(
                 category=args["category"],
@@ -482,6 +457,11 @@ async def ask_ai(user_message: str, history: list[dict]) -> dict:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(history[-AI_HISTORY_LIMIT:])
     messages.append({"role": "user", "content": user_message})
+
+    # Tracks whether the interactive summary UI should be displayed after the loop.
+    # Set when the AI calls show_summary; attached to the final reply so message.py
+    # can render the UI alongside any text the AI produces.
+    pending_show_summary: dict | None = None
 
     for _ in range(MAX_TOOL_ITERATIONS):
         try:
@@ -535,15 +515,26 @@ async def ask_ai(user_message: str, history: list[dict]) -> dict:
             if tool_name == "delete_expense":
                 return {"action": "delete", "n": int(args.get("n", 1))}
 
-            # show_summary — return to caller to render the interactive UI
+            # show_summary — fetch data so AI can reason, flag UI for display,
+            # then stay in the loop so the AI can formulate a text response
             if tool_name == "show_summary":
-                return {
-                    "action": "show_summary",
-                    "month": args.get("month"),
-                    "year":  args.get("year"),
+                now_dt = datetime.now()
+                pending_show_summary = {
+                    "month": args.get("month") or now_dt.month,
+                    "year":  args.get("year")  or now_dt.year,
                 }
+                data = await _run_get_monthly_summary(
+                    args.get("month"), args.get("year")
+                )
+                messages.append(choice.message)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": data,
+                })
+                continue
 
-            # Read tools: execute, feed result back, loop for final answer
+            # All other read tools: execute, feed result back, loop for final answer
             tool_result = await _execute_tool(tool_name, args)
             messages.append(choice.message)
             messages.append({
@@ -553,11 +544,17 @@ async def ask_ai(user_message: str, history: list[dict]) -> dict:
             })
             continue
 
-        # Plain text response — done
+        # Plain text response — done; attach show_summary if it was requested
         text = (choice.message.content or "").strip()
-        return {"action": "reply", "text": text or "Could you say that differently?"}
+        result: dict = {"action": "reply", "text": text}
+        if pending_show_summary:
+            result["show_summary"] = pending_show_summary
+        return result
 
-    return {
+    result = {
         "action": "reply",
         "text": "I had trouble processing that. Please try again.",
     }
+    if pending_show_summary:
+        result["show_summary"] = pending_show_summary
+    return result

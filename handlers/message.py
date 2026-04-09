@@ -228,25 +228,34 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(reply_text, parse_mode="HTML")
 
     # ------------------------------------------------------------------
-    # Show interactive budget summary (same UI as /summary)
-    # ------------------------------------------------------------------
-    elif action == "show_summary":
-        now = datetime.now()
-        month = ai_result.get("month") or now.month
-        year  = ai_result.get("year")  or now.year
-        dt    = datetime(year, month, 1)
-        msg   = await update.message.reply_text("Fetching summary...")
-        summary_text, keyboard = await asyncio.to_thread(get_summary, dt)
-        label = f"[Showed summary for {dt.strftime('%B %Y')}]"
-        _add_to_ai_history(context, "user", text)
-        _add_to_ai_history(context, "assistant", label)
-        await msg.edit_text(summary_text, parse_mode="HTML", reply_markup=keyboard)
-
-    # ------------------------------------------------------------------
     # Plain text reply (question, clarification, recommendation, etc.)
+    # Optionally accompanied by the interactive summary UI.
     # ------------------------------------------------------------------
     else:
-        reply_text = ai_result["text"]
+        show_summary_info = ai_result.get("show_summary")
+        reply_text        = ai_result.get("text", "").strip()
+
+        # Always record the user's message in history once
         _add_to_ai_history(context, "user", text)
-        _add_to_ai_history(context, "assistant", reply_text)
-        await update.message.reply_text(reply_text, parse_mode="HTML")
+
+        # Display the interactive summary UI if the AI requested it
+        if show_summary_info:
+            month = show_summary_info["month"]
+            year  = show_summary_info["year"]
+            dt    = datetime(year, month, 1)
+            msg   = await update.message.reply_text("Fetching summary...")
+            summary_text, keyboard = await asyncio.to_thread(get_summary, dt)
+            await msg.edit_text(summary_text, parse_mode="HTML", reply_markup=keyboard)
+            _add_to_ai_history(
+                context, "assistant",
+                f"[Showed summary for {dt.strftime('%B %Y')}]",
+            )
+
+        # Send the AI's text response only if it has something to say
+        if reply_text:
+            _add_to_ai_history(context, "assistant", reply_text)
+            await update.message.reply_text(reply_text, parse_mode="HTML")
+
+        # If neither the summary nor text was produced (shouldn't happen), log it
+        if not show_summary_info and not reply_text:
+            logger.warning("ask_ai returned empty reply with no show_summary for: %s", text)
