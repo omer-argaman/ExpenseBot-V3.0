@@ -3,11 +3,14 @@ handlers/ai_handler.py — OpenAI-powered assistant for the expense bot.
 
 ask_ai(user_message, history) -> dict
     Returns one of:
-        {"action": "log",   "category": str, "amount": float}
-        {"action": "reply", "text": str}
+        {"action": "log",        "category": str, "amount": float}
+        {"action": "log_multiple","expenses": [{"category": str, "amount": float}, ...]}
+        {"action": "delete",     "n": int}
+        {"action": "reply",      "text": str}
 
 Tools available to the AI:
-    log_expense           — log an expense (executed by the caller, not here)
+    log_expense           — log one expense (caller handles the write)
+    delete_expense        — delete/undo the last n expenses
     get_monthly_summary   — full budget vs actuals for any month
     get_category_spending — budget + transaction history for one category
     get_all_transactions  — every logged transaction across ALL categories for a
@@ -64,31 +67,47 @@ def _build_system_prompt() -> str:
     return f"""You are a smart, concise expense-tracking assistant for a household \
 budget bot. Today is {now.strftime('%B %d, %Y')}.
 
-You have four capabilities:
-1. LOG expenses          → call log_expense when you know category + amount.
-2. READ summary data     → call get_monthly_summary or compare_months for totals.
-3. READ transaction data → call get_category_spending (one category) or \
+You have five capabilities:
+1. LOG expenses          → call log_expense for each expense you identify.
+2. DELETE/UNDO expenses  → call delete_expense when the user wants to remove a \
+recent entry.
+3. READ summary data     → call get_monthly_summary or compare_months for totals.
+4. READ transaction data → call get_category_spending (one category) or \
 get_all_transactions (everything) to see individual entries, search notes, \
 find specific items.
-4. ADVISE                → after reading data, give specific, number-backed \
+5. ADVISE                → after reading data, give specific, number-backed \
 recommendations.
 
 VALID CATEGORIES (use the exact name shown):
 {categories_block}
 
-RULES:
-- Logging: call log_expense immediately — zero filler text alongside it.
+RULES — CATEGORIZATION:
+- Always categorize by WHAT was purchased, not WHERE. \
+  "snacks at a gas station" → Groceries or Other (Daily), NOT Fuel or Gas/Oil. \
+  "coffee at a pharmacy" → Coffee, NOT Health. \
+  "beer at the supermarket" → Beer / Wine, NOT Groceries.
+- When a category is ambiguous, pick the one that best matches the item itself.
+
+RULES — MULTIPLE EXPENSES:
+- When a single message contains multiple expenses, call log_expense ONCE PER \
+  EXPENSE in the same response. Do not stop after the first one.
+
+RULES — DELETING:
+- Call delete_expense when the user says anything like: "delete that", "undo", \
+  "that was wrong", "I made a mistake", "no, remove that", "cancel", "oops". \
+  Use n=1 unless the user specifies a different number.
+
+RULES — GENERAL:
+- Logging: call log_expense immediately — zero filler text alongside the call.
 - Questions about totals/budget: use get_monthly_summary or compare_months.
-- Questions about specific items, keywords, or individual entries (including \
-  emojis, names, stores, etc.): use get_all_transactions — it gives you every \
-  logged note across all categories so you can search through them.
-- Questions about one category's history: use get_category_spending.
+- Questions about specific items, keywords, or entries (including emojis, names, \
+  stores): use get_all_transactions.
+- Questions about one category: use get_category_spending.
 - Missing amount: ask in ONE sentence only.
-- Ambiguous category: pick the most likely one, log it.
-- Recommendations: reference real numbers, name the specific categories.
+- Recommendations: reference real numbers.
 - Currency is Israeli Shekel (₪).
 - NEVER say "Got it!", "Sure!", "I've logged that", or any filler.
-- Answer concisely — 1-4 sentences unless a detailed breakdown is requested.
+- Answer concisely — 1-4 sentences unless a full breakdown is requested.
 """
 
 SYSTEM_PROMPT = _build_system_prompt()
@@ -118,6 +137,33 @@ LOG_EXPENSE_TOOL = {
                 },
             },
             "required": ["category", "amount"],
+        },
+    },
+}
+
+DELETE_EXPENSE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "delete_expense",
+        "description": (
+            "Undo / delete the most recent expense(s). Call this when the user "
+            "expresses any intent to remove, undo, or cancel a recent entry — "
+            "e.g. 'delete that', 'undo', 'that was wrong', 'I made a mistake', "
+            "'oops', 'cancel', 'no, remove that'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "n": {
+                    "type": "integer",
+                    "description": (
+                        "Number of recent expenses to delete. "
+                        "Default is 1. Use a higher number only if the user "
+                        "explicitly asks to delete multiple (e.g. 'delete the last 3')."
+                    ),
+                },
+            },
+            "required": [],
         },
     },
 }
@@ -232,6 +278,7 @@ COMPARE_MONTHS_TOOL = {
 
 ALL_TOOLS = [
     LOG_EXPENSE_TOOL,
+    DELETE_EXPENSE_TOOL,
     GET_SUMMARY_TOOL,
     GET_CATEGORY_TOOL,
     GET_ALL_TRANSACTIONS_TOOL,
@@ -419,7 +466,28 @@ async def ask_ai(user_message: str, history: list[dict]) -> dict:
         choice = response.choices[0]
 
         if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
-            tool_call = choice.message.tool_calls[0]
+            all_calls = choice.message.tool_calls
+
+            # --- Collect ALL log_expense calls (multi-expense support) ----------
+            log_calls = [tc for tc in all_calls if tc.function.name == "log_expense"]
+            if log_calls:
+                expenses = []
+                for tc in log_calls:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                        expenses.append({
+                            "category": args.get("category", ""),
+                            "amount":   float(args.get("amount", 0)),
+                        })
+                    except (json.JSONDecodeError, ValueError, KeyError):
+                        continue
+                if expenses:
+                    if len(expenses) == 1:
+                        return {"action": "log", **expenses[0]}
+                    return {"action": "log_multiple", "expenses": expenses}
+
+            # --- Single non-log tool call ----------------------------------------
+            tool_call = all_calls[0]
             tool_name = tool_call.function.name
 
             try:
@@ -427,13 +495,9 @@ async def ask_ai(user_message: str, history: list[dict]) -> dict:
             except json.JSONDecodeError:
                 args = {}
 
-            # log_expense is a write op — return to caller immediately
-            if tool_name == "log_expense":
-                return {
-                    "action": "log",
-                    "category": args.get("category", ""),
-                    "amount": float(args.get("amount", 0)),
-                }
+            # delete_expense is a write op — return to caller
+            if tool_name == "delete_expense":
+                return {"action": "delete", "n": int(args.get("n", 1))}
 
             # Read tools: execute, feed result back, loop for final answer
             tool_result = await _execute_tool(tool_name, args)

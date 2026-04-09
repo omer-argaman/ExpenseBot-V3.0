@@ -27,7 +27,7 @@ from telegram.ext import ContextTypes
 
 from parsing.parser import parse, ParseResult
 from sheets import log_expense
-from handlers.commands import append_to_history
+from handlers.commands import append_to_history, delete as delete_expenses
 from handlers.subscribers import track_subscriber
 from handlers.ai_handler import ask_ai
 
@@ -159,13 +159,15 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     history = _get_ai_history(context)
     ai_result = await ask_ai(text, history)
 
-    if ai_result["action"] == "log":
-        category = ai_result["category"]
-        amount   = ai_result["amount"]
+    action = ai_result["action"]
 
+    # ------------------------------------------------------------------
+    # Single expense log
+    # ------------------------------------------------------------------
+    if action == "log":
         log_result = log_expense(
-            category=category,
-            amount=amount,
+            category=ai_result["category"],
+            amount=ai_result["amount"],
             original_text=text,
         )
         if log_result.success:
@@ -185,7 +187,48 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"❌ Sheet error: {log_result.message}", parse_mode="HTML"
             )
 
-    else:  # action == "reply"
+    # ------------------------------------------------------------------
+    # Multiple expenses in one message
+    # ------------------------------------------------------------------
+    elif action == "log_multiple":
+        lines = ["✅ Logged:"]
+        for exp in ai_result["expenses"]:
+            log_result = log_expense(
+                category=exp["category"],
+                amount=exp["amount"],
+                original_text=text,
+            )
+            if log_result.success:
+                append_to_history(
+                    category=log_result.category,
+                    amount=log_result.amount_added,
+                    tab_name=log_result.tab_name,
+                    row=log_result.row,
+                    timestamp=log_result.timestamp,
+                    original_text=text,
+                )
+                lines.append(f"  • ₪{exp['amount']:g} → {exp['category']}")
+            else:
+                lines.append(f"  • ❌ {exp['category']}: {log_result.message}")
+        reply_text = "\n".join(lines)
+        _add_to_ai_history(context, "user", text)
+        _add_to_ai_history(context, "assistant", reply_text)
+        await update.message.reply_text(f"<b>{reply_text}</b>", parse_mode="HTML")
+
+    # ------------------------------------------------------------------
+    # Delete / undo
+    # ------------------------------------------------------------------
+    elif action == "delete":
+        n = ai_result.get("n", 1)
+        reply_text = delete_expenses(n)
+        _add_to_ai_history(context, "user", text)
+        _add_to_ai_history(context, "assistant", reply_text)
+        await update.message.reply_text(reply_text, parse_mode="HTML")
+
+    # ------------------------------------------------------------------
+    # Plain text reply (question, clarification, recommendation, etc.)
+    # ------------------------------------------------------------------
+    else:
         reply_text = ai_result["text"]
         _add_to_ai_history(context, "user", text)
         _add_to_ai_history(context, "assistant", reply_text)
