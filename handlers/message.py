@@ -20,14 +20,16 @@ The AI handler caps how far back it looks, so this list can grow indefinitely
 without ballooning prompt costs.
 """
 
+import asyncio
 import logging
+from datetime import datetime
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from parsing.parser import parse, ParseResult
 from sheets import log_expense
-from handlers.commands import append_to_history, delete as delete_expenses
+from handlers.commands import append_to_history, delete as delete_expenses, summary as get_summary
 from handlers.subscribers import track_subscriber
 from handlers.ai_handler import ask_ai
 
@@ -224,6 +226,21 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         _add_to_ai_history(context, "user", text)
         _add_to_ai_history(context, "assistant", reply_text)
         await update.message.reply_text(reply_text, parse_mode="HTML")
+
+    # ------------------------------------------------------------------
+    # Show interactive budget summary (same UI as /summary)
+    # ------------------------------------------------------------------
+    elif action == "show_summary":
+        now = datetime.now()
+        month = ai_result.get("month") or now.month
+        year  = ai_result.get("year")  or now.year
+        dt    = datetime(year, month, 1)
+        msg   = await update.message.reply_text("Fetching summary...")
+        summary_text, keyboard = await asyncio.to_thread(get_summary, dt)
+        label = f"[Showed summary for {dt.strftime('%B %Y')}]"
+        _add_to_ai_history(context, "user", text)
+        _add_to_ai_history(context, "assistant", label)
+        await msg.edit_text(summary_text, parse_mode="HTML", reply_markup=keyboard)
 
     # ------------------------------------------------------------------
     # Plain text reply (question, clarification, recommendation, etc.)

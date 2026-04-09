@@ -67,15 +67,18 @@ def _build_system_prompt() -> str:
     return f"""You are a smart, concise expense-tracking assistant for a household \
 budget bot. Today is {now.strftime('%B %d, %Y')}.
 
-You have five capabilities:
+You have six capabilities:
 1. LOG expenses          → call log_expense for each expense you identify.
 2. DELETE/UNDO expenses  → call delete_expense when the user wants to remove a \
 recent entry.
-3. READ summary data     → call get_monthly_summary or compare_months for totals.
-4. READ transaction data → call get_category_spending (one category) or \
+3. SHOW summary UI       → call show_summary when the user wants to VIEW the \
+budget overview screen.
+4. READ summary data     → call get_monthly_summary or compare_months when you \
+need numbers to answer a specific question internally.
+5. READ transaction data → call get_category_spending (one category) or \
 get_all_transactions (everything) to see individual entries, search notes, \
 find specific items.
-5. ADVISE                → after reading data, give specific, number-backed \
+6. ADVISE                → after reading data, give specific, number-backed \
 recommendations.
 
 VALID CATEGORIES (use the exact name shown):
@@ -168,14 +171,46 @@ DELETE_EXPENSE_TOOL = {
     },
 }
 
+SHOW_SUMMARY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "show_summary",
+        "description": (
+            "Display the interactive budget summary to the user, with navigation "
+            "buttons to browse months and drill into sections. Call this when the "
+            "user wants to VIEW or OPEN the summary — e.g. 'show me the summary', "
+            "'open summary', 'budget overview', 'how's my budget looking?', "
+            "'show last month's budget', or any phrasing that means 'show me the "
+            "summary screen'. Use get_monthly_summary instead when you need to "
+            "READ the numbers internally to answer a specific question."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "month": {
+                    "type": "integer",
+                    "description": "Month 1–12. Omit for current month.",
+                },
+                "year": {
+                    "type": "integer",
+                    "description": "4-digit year. Omit for current year.",
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
 GET_SUMMARY_TOOL = {
     "type": "function",
     "function": {
         "name": "get_monthly_summary",
         "description": (
-            "Get the full budget vs actual spending breakdown for a given month. "
-            "Use for questions about overall spending, budget status, over-budget "
-            "sections, or to produce recommendations."
+            "Read the full budget vs actual spending breakdown for a given month "
+            "so you can reason about it and answer a specific question. Use for "
+            "questions like 'am I over budget?', 'how much did I spend in total?', "
+            "or when generating recommendations. Use show_summary instead if the "
+            "user simply wants to see the summary screen."
         ),
         "parameters": {
             "type": "object",
@@ -279,6 +314,7 @@ COMPARE_MONTHS_TOOL = {
 ALL_TOOLS = [
     LOG_EXPENSE_TOOL,
     DELETE_EXPENSE_TOOL,
+    SHOW_SUMMARY_TOOL,
     GET_SUMMARY_TOOL,
     GET_CATEGORY_TOOL,
     GET_ALL_TRANSACTIONS_TOOL,
@@ -495,9 +531,17 @@ async def ask_ai(user_message: str, history: list[dict]) -> dict:
             except json.JSONDecodeError:
                 args = {}
 
-            # delete_expense is a write op — return to caller
+            # delete_expense — return to caller for execution
             if tool_name == "delete_expense":
                 return {"action": "delete", "n": int(args.get("n", 1))}
+
+            # show_summary — return to caller to render the interactive UI
+            if tool_name == "show_summary":
+                return {
+                    "action": "show_summary",
+                    "month": args.get("month"),
+                    "year":  args.get("year"),
+                }
 
             # Read tools: execute, feed result back, loop for final answer
             tool_result = await _execute_tool(tool_name, args)
