@@ -16,8 +16,9 @@ Conversation history
 --------------------
 Per-user history is stored in context.user_data["ai_history"] as a plain list
 of {"role": "user"|"assistant", "content": str} dicts (OpenAI message format).
-The AI handler caps how far back it looks, so this list can grow indefinitely
-without ballooning prompt costs.
+The list is hard-capped at AI_HISTORY_MAX_STORED entries so it cannot grow
+without bound, and each individual entry is truncated at MAX_CONTENT_CHARS to
+prevent one verbose turn from ballooning memory.
 """
 
 import asyncio
@@ -34,6 +35,16 @@ from handlers.subscribers import track_subscriber
 from handlers.ai_handler import ask_ai
 
 logger = logging.getLogger(__name__)
+
+# Keep at most this many entries in ai_history (each "user" + each "assistant"
+# counts as one). 24 = 12 full exchanges — larger than AI_HISTORY_LIMIT (12) so
+# trimming is cheap and there's always enough context for the AI to read.
+AI_HISTORY_MAX_STORED = 24
+
+# Truncate any single history entry to this many characters. Long tool outputs
+# (e.g. summary text) occasionally leak into assistant messages; cap them so
+# one entry cannot balloon memory on its own.
+MAX_CONTENT_CHARS = 1000
 
 
 def process_expense(text: str) -> tuple[str, ParseResult]:
@@ -97,9 +108,24 @@ def process_expense(text: str) -> tuple[str, ParseResult]:
 # ---------------------------------------------------------------------------
 
 def _add_to_ai_history(context: ContextTypes.DEFAULT_TYPE, role: str, content: str) -> None:
-    """Append a message to the per-user AI conversation history."""
+    """
+    Append a message to the per-user AI conversation history.
+
+    Bounded in two ways to prevent the memory leak that previously pushed the
+    bot past Render's 512 MB limit:
+      1. Each entry's content is truncated at MAX_CONTENT_CHARS.
+      2. The total list length is capped at AI_HISTORY_MAX_STORED — oldest
+         entries are dropped when the cap is exceeded.
+    """
+    if len(content) > MAX_CONTENT_CHARS:
+        content = content[:MAX_CONTENT_CHARS] + "..."
+
     history: list = context.user_data.setdefault("ai_history", [])
     history.append({"role": role, "content": content})
+
+    overflow = len(history) - AI_HISTORY_MAX_STORED
+    if overflow > 0:
+        del history[:overflow]
 
 
 def _get_ai_history(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
@@ -123,6 +149,7 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         If AI replies with text → send it (e.g. asking for the amount).
     """
     track_subscriber(update.effective_chat.id)
+    context.user_data["last_seen"] = datetime.now().timestamp()
     text = update.message.text.strip()
 
     result = parse(text)

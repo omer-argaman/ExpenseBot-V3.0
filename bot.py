@@ -11,13 +11,14 @@ when business logic changes.
 import logging
 import os
 import threading
-from datetime import time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
+    ContextTypes,
     MessageHandler,
     filters,
 )
@@ -64,6 +65,31 @@ def _start_health_server() -> None:
     server.serve_forever()
 
 
+# ---------------------------------------------------------------------------
+# Idle-user cleanup — safety net for the in-memory AI history
+# ---------------------------------------------------------------------------
+#
+# Even with a hard per-user cap on ai_history length, python-telegram-bot holds
+# every user's user_data dict in memory forever (one entry per chat_id). For
+# users who stop messaging entirely, that dict just sits there. This weekly job
+# drops the history of anyone idle for more than IDLE_THRESHOLD_DAYS.
+
+IDLE_THRESHOLD_DAYS = 7
+
+
+async def _cleanup_idle_users(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Drop ai_history for users who haven't messaged in IDLE_THRESHOLD_DAYS."""
+    cutoff = (datetime.now() - timedelta(days=IDLE_THRESHOLD_DAYS)).timestamp()
+    cleaned = 0
+    for user_data in context.application.user_data.values():
+        last_seen = user_data.get("last_seen", 0)
+        if last_seen < cutoff and user_data.get("ai_history"):
+            user_data.pop("ai_history", None)
+            cleaned += 1
+    if cleaned:
+        logger.info(f"Idle-cleanup: dropped ai_history for {cleaned} idle user(s)")
+
+
 async def _post_init(application: Application) -> None:
     """Register scheduled jobs after the Application is fully initialised."""
     application.job_queue.run_monthly(
@@ -72,6 +98,14 @@ async def _post_init(application: Application) -> None:
         day=1,
     )
     logger.info("Monthly report job registered: 1st of each month at 09:00 IST")
+
+    application.job_queue.run_repeating(
+        _cleanup_idle_users,
+        interval=timedelta(days=1),
+        first=timedelta(hours=1),
+    )
+    logger.info("Idle-user cleanup job registered: runs daily, "
+                f"drops history for users idle > {IDLE_THRESHOLD_DAYS} days")
 
 
 def create_app() -> Application:
