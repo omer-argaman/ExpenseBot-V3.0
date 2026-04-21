@@ -32,7 +32,7 @@ from parsing.parser import parse, ParseResult
 from sheets import log_expense
 from handlers.commands import append_to_history, delete as delete_expenses, summary as get_summary
 from handlers.subscribers import track_subscriber
-from handlers.ai_handler import ask_ai
+from handlers.ai_handler import ask_ai, explain_sheet_missing
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +132,28 @@ def _get_ai_history(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
     return context.user_data.get("ai_history", [])
 
 
+async def _handle_log_failure(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    log_result,
+    user_text: str,
+) -> None:
+    """
+    Send a helpful error when log_expense() fails.
+
+    If the failure was a missing month tab, ask the AI to explain exactly
+    what's wrong (whitespace, typo, missing sheet, etc.) — see
+    ai_handler.explain_sheet_missing. For any other failure, fall back to
+    the raw LogResult.message.
+    """
+    if log_result.failure is not None:
+        explanation = await explain_sheet_missing(user_text, log_result.failure)
+    else:
+        explanation = f"❌ {log_result.message}"
+    _add_to_ai_history(context, "assistant", explanation)
+    await update.message.reply_text(explanation, parse_mode="HTML")
+
+
 # ---------------------------------------------------------------------------
 # Telegram handler
 # ---------------------------------------------------------------------------
@@ -177,9 +199,8 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             _add_to_ai_history(context, "assistant", log_result.message)
             await update.message.reply_text(f"<b>{log_result.message}</b>", parse_mode="HTML")
         else:
-            await update.message.reply_text(
-                f"❌ Sheet error: {log_result.message}", parse_mode="HTML"
-            )
+            _add_to_ai_history(context, "user", text)
+            await _handle_log_failure(update, context, log_result, text)
         return
 
     # ------------------------------------------------------------------
@@ -212,15 +233,15 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             _add_to_ai_history(context, "assistant", log_result.message)
             await update.message.reply_text(f"<b>{log_result.message}</b>", parse_mode="HTML")
         else:
-            await update.message.reply_text(
-                f"❌ Sheet error: {log_result.message}", parse_mode="HTML"
-            )
+            _add_to_ai_history(context, "user", text)
+            await _handle_log_failure(update, context, log_result, text)
 
     # ------------------------------------------------------------------
     # Multiple expenses in one message
     # ------------------------------------------------------------------
     elif action == "log_multiple":
         lines = ["✅ Logged:"]
+        sheet_failure_result = None
         for exp in ai_result["expenses"]:
             log_result = log_expense(
                 category=exp["category"],
@@ -237,12 +258,28 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     original_text=text,
                 )
                 lines.append(f"  • ₪{exp['amount']:g} → {exp['category']}")
+            elif log_result.failure is not None:
+                # Sheet is missing — all remaining expenses would fail for
+                # the same reason. Short-circuit and explain once.
+                sheet_failure_result = log_result
+                break
             else:
                 lines.append(f"  • ❌ {exp['category']}: {log_result.message}")
-        reply_text = "\n".join(lines)
+
         _add_to_ai_history(context, "user", text)
-        _add_to_ai_history(context, "assistant", reply_text)
-        await update.message.reply_text(f"<b>{reply_text}</b>", parse_mode="HTML")
+
+        if sheet_failure_result is not None:
+            # Send whatever succeeded first (if anything), then the AI
+            # explanation for the sheet problem.
+            if len(lines) > 1:
+                partial = "\n".join(lines)
+                _add_to_ai_history(context, "assistant", partial)
+                await update.message.reply_text(f"<b>{partial}</b>", parse_mode="HTML")
+            await _handle_log_failure(update, context, sheet_failure_result, text)
+        else:
+            reply_text = "\n".join(lines)
+            _add_to_ai_history(context, "assistant", reply_text)
+            await update.message.reply_text(f"<b>{reply_text}</b>", parse_mode="HTML")
 
     # ------------------------------------------------------------------
     # Delete / undo

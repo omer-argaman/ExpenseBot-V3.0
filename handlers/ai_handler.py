@@ -558,3 +558,108 @@ async def ask_ai(user_message: str, history: list[dict]) -> dict:
     if pending_show_summary:
         result["show_summary"] = pending_show_summary
     return result
+
+
+# ---------------------------------------------------------------------------
+# Sheet-missing error explanation
+#
+# Called from handlers/message.py when log_expense() fails because the month
+# tab can't be resolved. One-shot call (no tools, no history) — just asks the
+# model to produce a short natural-language explanation of the likely cause.
+#
+# Critically, the prompt forbids the model from assuming a typo is a typo:
+# if a suspicious near-miss like '0246' exists when the target is '0426',
+# the explanation must ask the user to confirm, not proceed. The bot never
+# logs anywhere until the user takes action (renaming or creating a sheet).
+# ---------------------------------------------------------------------------
+
+_SHEET_MISSING_SYSTEM_PROMPT = """You are a helpful assistant inside a Telegram \
+expense-tracking bot. The bot writes expenses to a monthly tab in a Google \
+Sheet. The standard tab name is MMYY (e.g. '0426' for April 2026), though \
+other formats like '04/26', '04-26', 'April 2026' are also recognised.
+
+The bot just failed to find a tab for the user's target month. Your job is \
+to write ONE short message (2-4 sentences, Hebrew-friendly since the users \
+write in mixed Hebrew/English) explaining the most likely cause and what \
+the user should do.
+
+You will be given the target month and the full list of existing tab names \
+in the spreadsheet. Reason as follows:
+
+1. If a tab exists whose DIGIT content matches the target month but our \
+   matcher missed it (very unusual — whitespace/punctuation variants are \
+   already auto-accepted) — point to that tab and suggest the user rename \
+   it to the plain MMYY form.
+
+2. If a tab exists that looks like it could be a TYPO of the target \
+   (e.g. target '0426', existing '0246' — which would otherwise parse to \
+   an implausible month like Feb 2046): DO NOT assume. Say something like \
+   'I noticed a tab called \"0246\" — if you meant April 2026, please \
+   rename it to \"0426\". If it's really a different month, leave it alone \
+   and instead create a sheet named \"0426\".' Let the user decide.
+
+3. If the closest existing tab is a legitimate DIFFERENT month \
+   (e.g. target '0426', existing '0326' for March, or '0526' for May) — \
+   that's a real sheet for another month, NOT a typo. Just say the target \
+   sheet doesn't exist yet and list 2-3 recent tabs so they see the \
+   naming convention.
+
+4. If nothing relevant exists at all — say the sheet is missing and they \
+   need to create one, showing the expected name and a couple of recent \
+   tabs for reference.
+
+Rules you must follow:
+- Never invent tab names that aren't in the list.
+- Never instruct the bot to proceed or log anywhere. The user decides.
+- No emojis. Plain text only (the reply will be sent with HTML parse mode, \
+  so avoid HTML characters like < > & that aren't part of actual tags).
+- Be concise. One short paragraph, no bullet lists.
+"""
+
+
+async def explain_sheet_missing(user_message: str, failure) -> str:
+    """
+    Produce a natural-language explanation of why the target sheet couldn't
+    be found, given a TabLookupFailure from sheets.py.
+
+    One-shot: no tools, no history, no retries. Falls back to a templated
+    message if the API call fails.
+    """
+    # Keep the prompt small — cap the tab list to avoid ballooning tokens
+    # for users with many years of tabs.
+    tabs_preview = failure.existing_tabs[:40]
+    tabs_note = ""
+    if len(failure.existing_tabs) > 40:
+        tabs_note = f"\n(plus {len(failure.existing_tabs) - 40} older tabs not shown)"
+
+    user_content = (
+        f"Target month: {failure.target_month}\n"
+        f"Tab name formats the bot tried: {failure.tried_formats}\n"
+        f"Existing tab names in the spreadsheet: {tabs_preview}{tabs_note}\n\n"
+        f"The user's original message was: {user_message!r}\n\n"
+        f"Write the explanation."
+    )
+
+    try:
+        response = await _get_client().chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": _SHEET_MISSING_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.2,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        if text:
+            return text
+    except Exception as exc:
+        logger.error("OpenAI error in explain_sheet_missing: %s", exc)
+
+    # Fallback: deterministic template so the user still gets something useful
+    recent = ", ".join(failure.existing_tabs[:3]) if failure.existing_tabs else "(none)"
+    return (
+        f"I couldn't find a sheet tab for {failure.target_month}. "
+        f"Your most recent sheets are: {recent}. "
+        f"Please check that you have a tab named '{failure.tried_formats[0]}' "
+        f"(or rename an existing one if it's close)."
+    )

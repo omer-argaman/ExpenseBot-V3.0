@@ -33,6 +33,7 @@ from sheets import (
     _read_existing_note,
     _write_amount,
     _write_note,
+    get_spreadsheet_tabs,
     SPREADSHEET_ID,
 )
 
@@ -151,6 +152,38 @@ def _next_month(dt: datetime) -> datetime:
     return dt.replace(month=dt.month + 1, day=1)
 
 
+def _tab_not_found_message(service, dt: datetime) -> str:
+    """
+    Build a helpful 'sheet missing' message for the slash-command path.
+
+    Unlike the logging flow (which goes through the AI explanation), slash
+    commands return plain strings synchronously. A deterministic template
+    that lists the user's most recent tab names is usually enough — they
+    can see the naming convention and fix their sheet name themselves.
+    """
+    expected = dt.strftime("%m%y")
+    month_label = dt.strftime("%B %Y")
+    try:
+        existing = [title for (title, _sid) in get_spreadsheet_tabs(service).values()]
+    except Exception as exc:
+        logger.warning(f"Could not fetch tab list for not-found message: {exc}")
+        existing = []
+
+    if not existing:
+        return (
+            f"No sheet tab found for {month_label}. "
+            f"Please create a tab named '{expected}'."
+        )
+
+    recent = ", ".join(existing[:5])
+    return (
+        f"No sheet tab found for {month_label}. "
+        f"Your existing sheets: {recent}. "
+        f"If you have a tab for this month but it's named differently, "
+        f"please rename it to '{expected}'."
+    )
+
+
 def _summary_keyboard(dt: datetime, section_names: list[str] = None) -> InlineKeyboardMarkup:
     """
     Build the summary keyboard:
@@ -236,7 +269,7 @@ def summary(dt: datetime = None) -> tuple[str, InlineKeyboardMarkup]:
 
     if not tab_info:
         return (
-            f"No sheet tab found for {dt.strftime('%B %Y')}. Please create it first.",
+            _tab_not_found_message(service, dt),
             _summary_keyboard(dt),
         )
 
@@ -306,7 +339,7 @@ def section_detail(section_name: str, dt: datetime = None) -> tuple[str, InlineK
     tab_info = find_tab_for_month(service, dt)
     if not tab_info:
         return (
-            f"No sheet tab for {dt.strftime('%B %Y')}.",
+            _tab_not_found_message(service, dt),
             _summary_keyboard(dt),
         )
 
@@ -358,7 +391,7 @@ def category(name: str, dt: datetime = None) -> str:
     service = _build_service()
     tab_info = find_tab_for_month(service, dt)
     if not tab_info:
-        return f"No sheet tab found for {dt.strftime('%B %Y')}."
+        return _tab_not_found_message(service, dt)
     tab_name, _ = tab_info
 
     row = find_category_row(service, tab_name, canonical)
@@ -410,7 +443,7 @@ def balance(name: str, dt: datetime = None) -> str:
     service = _build_service()
     tab_info = find_tab_for_month(service, dt)
     if not tab_info:
-        return f"No sheet tab found for {dt.strftime('%B %Y')}."
+        return _tab_not_found_message(service, dt)
     tab_name, _ = tab_info
 
     row = find_category_row(service, tab_name, canonical)

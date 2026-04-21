@@ -23,6 +23,7 @@ from handlers.commands import (
     delete as do_delete,
     BROAD_CATEGORIES,
 )
+from handlers.ai_handler import explain_sheet_missing
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +79,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_text(
                 f"<b>{log_result.message}</b>", parse_mode="HTML"
             )
+        elif log_result.failure is not None:
+            explanation = await explain_sheet_missing(original, log_result.failure)
+            await query.edit_message_text(explanation, parse_mode="HTML")
         else:
             await query.edit_message_text(
-                f"❌ Sheet error: {log_result.message}", parse_mode="HTML"
+                f"❌ {log_result.message}", parse_mode="HTML"
             )
 
     # ------------------------------------------------------------------

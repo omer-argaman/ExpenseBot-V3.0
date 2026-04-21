@@ -77,6 +77,24 @@ def _candidate_tab_names(dt: datetime) -> list[str]:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class TabLookupFailure:
+    """
+    Structured context for a failed month-tab lookup.
+
+    Handed to the AI error-explanation path so it can reason about whether
+    the user has a typo (e.g. '0246' instead of '0426'), a whitespace issue
+    that our normalized matcher somehow still missed, or simply hasn't
+    created a sheet for this month yet. We pass the FULL tab list rather
+    than pre-filtering with a similarity score — an LLM is much better at
+    deciding whether '0246' is a typo of '0426' or a legitimate sheet for
+    a different month, because it understands MMYY date semantics.
+    """
+    target_month: str           # e.g. "April 2026"
+    tried_formats: list[str]    # candidate names we attempted
+    existing_tabs: list[str]    # ALL current tab titles, original-cased
+
+
+@dataclass
 class LogResult:
     success: bool
     category: str
@@ -86,6 +104,7 @@ class LogResult:
     row: int
     timestamp: str        # the timestamp written into the note (used by /delete)
     message: str          # human-readable summary
+    failure: Optional[TabLookupFailure] = None  # set when the failure was a missing tab
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +146,19 @@ def get_spreadsheet_tabs(service) -> dict[str, tuple[str, int]]:
     }
 
 
+def _normalize(s: str) -> str:
+    """
+    Strip whitespace and non-alphanumerics, lowercase everything.
+
+    Crucially, digits are preserved verbatim — so '0426' and '0246' normalize
+    to different strings and can NEVER collide. That is what makes this safe
+    to auto-accept: any match at this layer is guaranteed to represent the
+    same month as the target, just written with different whitespace or
+    punctuation (' 0426', '04 26', '04-26', '04.26', 'Apr.2026', etc.).
+    """
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
 def find_tab_in_tabs(
     existing_tabs: dict[str, tuple[str, int]],
     dt: datetime,
@@ -134,12 +166,36 @@ def find_tab_in_tabs(
     """
     Find the tab for `dt` using a pre-fetched tabs dict (no API call).
     Returns (tab_name, sheet_id) or None.
+
+    Two-pass matching, safest first:
+      1. Exact lowercased match (current fastest-path behavior).
+      2. Normalized match — strips whitespace and punctuation only. Safe
+         because the digit content is preserved, so a different month's
+         tab can never be mistaken for the target.
+    Typo matching (e.g. '0246' vs '0426') is intentionally NOT performed
+    here — that ambiguity is surfaced to the user via the AI error path.
     """
-    for candidate in _candidate_tab_names(dt):
+    candidates = _candidate_tab_names(dt)
+
+    for candidate in candidates:
         match = existing_tabs.get(candidate.lower())
         if match:
-            logger.info(f"Matched tab '{match[0]}' for {dt.strftime('%B %Y')}")
+            logger.info(f"Matched tab '{match[0]}' for {dt.strftime('%B %Y')} (exact)")
             return match
+
+    normalized_existing = {
+        _normalize(lower_title): value
+        for lower_title, value in existing_tabs.items()
+    }
+    for candidate in candidates:
+        match = normalized_existing.get(_normalize(candidate))
+        if match:
+            logger.info(
+                f"Matched tab '{match[0]}' for {dt.strftime('%B %Y')} "
+                f"(normalized — whitespace/punctuation variance)"
+            )
+            return match
+
     logger.debug(f"No tab found for {dt.strftime('%B %Y')}")
     return None
 
@@ -156,6 +212,21 @@ def find_tab_for_month(service, dt: datetime) -> Optional[tuple[str, int]]:
     if not result:
         logger.warning(f"No tab found for {dt.strftime('%B %Y')}. Tried: {_candidate_tab_names(dt)}")
     return result
+
+
+def describe_tab_failure(
+    existing_tabs: dict[str, tuple[str, int]],
+    dt: datetime,
+) -> TabLookupFailure:
+    """
+    Build a TabLookupFailure with the context needed by the AI error path.
+    Call this ONLY when find_tab_in_tabs() has already returned None.
+    """
+    return TabLookupFailure(
+        target_month=dt.strftime("%B %Y"),
+        tried_formats=_candidate_tab_names(dt),
+        existing_tabs=[original for (original, _sid) in existing_tabs.values()],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -319,9 +390,15 @@ def log_expense(
 
     service = _build_service()
 
-    # 1. Find the right month tab
-    tab_info = find_tab_for_month(service, dt)
+    # 1. Find the right month tab — fetch tabs once so we can build a rich
+    #    failure object without a second metadata call.
+    existing_tabs = get_spreadsheet_tabs(service)
+    tab_info = find_tab_in_tabs(existing_tabs, dt)
     if tab_info is None:
+        logger.warning(
+            f"No tab found for {dt.strftime('%B %Y')}. "
+            f"Tried: {_candidate_tab_names(dt)}"
+        )
         return LogResult(
             success=False,
             category=category,
@@ -330,7 +407,8 @@ def log_expense(
             tab_name="",
             row=0,
             timestamp="",
-            message=f"No sheet tab found for {dt.strftime('%B %Y')}. Please create it first.",
+            message=f"No sheet tab found for {dt.strftime('%B %Y')}.",
+            failure=describe_tab_failure(existing_tabs, dt),
         )
     tab_name, sheet_id = tab_info
 
