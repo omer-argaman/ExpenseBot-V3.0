@@ -74,7 +74,7 @@ def _start_health_server() -> None:
 # users who stop messaging entirely, that dict just sits there. This weekly job
 # drops the history of anyone idle for more than IDLE_THRESHOLD_DAYS.
 
-IDLE_THRESHOLD_DAYS = 7
+IDLE_THRESHOLD_DAYS = 2
 
 
 async def _cleanup_idle_users(context: ContextTypes.DEFAULT_TYPE) -> None:
