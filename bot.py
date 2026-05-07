@@ -9,11 +9,9 @@ when business logic changes.
 """
 
 import logging
-import os
-import threading
 from datetime import datetime, time as dt_time, timedelta
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from telegram import Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -36,6 +34,7 @@ from handlers.commands import (
 )
 from handlers.message import tg_handle_message
 from handlers.monthly_report import send_monthly_report, tg_test_report
+from server import start_in_thread as start_flask_server
 
 logging.basicConfig(
     format="%(asctime)s  %(levelname)s  %(name)s  %(message)s",
@@ -45,24 +44,20 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Minimal HTTP server — keeps Render (Web Service) happy by binding to PORT
+# /whoami — returns the user's chat id so they can set OWNER_CHAT_ID on Render
 # ---------------------------------------------------------------------------
 
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def log_message(self, *args):
-        pass  # suppress noisy access logs
-
-
-def _start_health_server() -> None:
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
-    logger.info(f"Health server listening on port {port}")
-    server.serve_forever()
+async def tg_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    name = user.full_name if user else "<unknown>"
+    await update.message.reply_text(
+        f"Your Telegram chat id: <code>{chat_id}</code>\n"
+        f"Name: {name}\n\n"
+        f"Set this on Render as <code>OWNER_CHAT_ID</code> so the SMS pipeline "
+        f"knows where to send transaction notifications.",
+        parse_mode="HTML",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +124,7 @@ def create_app() -> Application:
     app.add_handler(CommandHandler("balance",    tg_balance))
     app.add_handler(CommandHandler("delete",      tg_delete))
     app.add_handler(CommandHandler("report", tg_test_report))
+    app.add_handler(CommandHandler("whoami", tg_whoami))
 
     # Inline button callbacks (fuzzy confirm yes/no)
     app.add_handler(CallbackQueryHandler(handle_callback))
@@ -140,6 +136,8 @@ def create_app() -> Application:
 
 
 if __name__ == "__main__":
-    threading.Thread(target=_start_health_server, daemon=True).start()
+    # Flask serves /healthz (Render keepalive) and /ingest (SMS/email webhook).
+    # Daemon thread shares the process with the python-telegram-bot polling loop.
+    start_flask_server()
     logger.info("Starting bot...")
     create_app().run_polling()

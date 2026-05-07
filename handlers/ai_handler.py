@@ -663,3 +663,175 @@ async def explain_sheet_missing(user_message: str, failure) -> str:
         f"Please check that you have a tab named '{failure.tried_formats[0]}' "
         f"(or rename an existing one if it's close)."
     )
+
+
+# ---------------------------------------------------------------------------
+# Merchant categorization for the SMS / email pipeline
+#
+# One-shot synchronous-friendly call: given a merchant name (normalized),
+# the amount, an optional card prior, and any prior fuzzy-map hint, ask the
+# model to choose the best category and rate its own confidence.
+#
+# Returned shape:
+#   {
+#     "category":   <one of CATEGORY_MAP.keys() or None on parse failure>,
+#     "confidence": <float 0.0 - 1.0>,
+#     "reason":     <short string for logs / Telegram>,
+#     "alternatives": [<other plausible categories>, ...]  # for ask buttons
+#   }
+# ---------------------------------------------------------------------------
+
+_CATEGORIZE_SYSTEM_PROMPT = """You are categorizing a single credit-card \
+transaction for a household budget tracker. The transaction comes from an \
+Israeli credit-card SMS or email; the merchant string may be in Hebrew, \
+English, or a mix, and may be slightly truncated.
+
+You will be given:
+  - the merchant name (normalized for lookup)
+  - the amount (in the original currency)
+  - optionally, a card prior — a short list of categories that this card \
+    is *usually* used for; treat this as a hint, not a hard rule
+  - optionally, a fuzzy hint from the user's existing merchant map
+
+You MUST respond with ONLY valid JSON in this exact shape:
+{
+  "category":   "<one of the valid categories below, EXACT spelling>",
+  "confidence": <float between 0.0 and 1.0>,
+  "reason":     "<one short sentence; can be Hebrew or English>",
+  "alternatives": ["<other plausible category>", "..."]
+}
+
+Confidence guidance:
+  - 0.95+  the merchant name unambiguously identifies the category
+  - 0.80-0.94  strong signal (well-known chain or category prior matches)
+  - 0.50-0.79  educated guess; the user should probably confirm
+  - <0.50  you're unsure; provide your best guess but flag the doubt
+
+`alternatives` should contain 2-3 other plausible categories, ordered by \
+likelihood, NOT including the chosen one. These power the inline buttons \
+the user taps when confidence is low.
+
+Categorize by WHAT was bought, not WHERE. "Coffee at a pharmacy" -> Coffee, \
+not Health. "Beer at the supermarket" -> Beer / Wine, not Groceries.
+"""
+
+
+def _build_categorize_user_prompt(
+    merchant: str,
+    amount: float,
+    currency: str,
+    card_prior: list[str] | None,
+    card_name: str | None,
+    fuzzy_hint: tuple[str, str, float] | None,
+) -> str:
+    valid_categories = "\n".join(f"  - {c}" for c in CATEGORY_MAP.keys())
+    lines = [
+        f"Merchant: {merchant}",
+        f"Amount: {amount:g} {currency}",
+    ]
+    if card_name:
+        lines.append(f"Card: {card_name}")
+    if card_prior:
+        lines.append(
+            "Card prior (this card is usually used for one of these): "
+            + ", ".join(card_prior)
+        )
+    if fuzzy_hint:
+        hint_merchant, hint_category, hint_score = fuzzy_hint
+        lines.append(
+            f"Fuzzy hint from existing merchant map: a similar merchant "
+            f"'{hint_merchant}' was previously categorized as "
+            f"'{hint_category}' (similarity {hint_score:.0%}). Treat as a hint."
+        )
+    lines.append("")
+    lines.append("Valid categories (use the EXACT spelling):")
+    lines.append(valid_categories)
+    return "\n".join(lines)
+
+
+async def ai_categorize_merchant(
+    merchant: str,
+    amount: float,
+    currency: str = "ILS",
+    card_prior: list[str] | None = None,
+    card_name: str | None = None,
+    fuzzy_hint: tuple[str, str, float] | None = None,
+) -> dict:
+    """
+    Ask the model to pick a category for this single merchant.
+
+    One OpenAI call, JSON response. Falls back to a conservative empty
+    result if the call or the JSON parse fails — the caller will route
+    the transaction to a Telegram ask in that case.
+    """
+    user_prompt = _build_categorize_user_prompt(
+        merchant=merchant,
+        amount=amount,
+        currency=currency,
+        card_prior=card_prior,
+        card_name=card_name,
+        fuzzy_hint=fuzzy_hint,
+    )
+
+    try:
+        response = await _get_client().chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": _CATEGORIZE_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        raw = response.choices[0].message.content or "{}"
+        data = json.loads(raw)
+    except Exception as exc:
+        logger.error("ai_categorize_merchant failed: %s", exc)
+        return {"category": None, "confidence": 0.0, "reason": str(exc),
+                "alternatives": []}
+
+    # Defensive normalization
+    valid = set(CATEGORY_MAP.keys())
+    category = data.get("category")
+    if category not in valid:
+        category = None
+
+    try:
+        confidence = float(data.get("confidence", 0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    alternatives = [a for a in (data.get("alternatives") or []) if a in valid][:3]
+
+    return {
+        "category": category,
+        "confidence": confidence,
+        "reason": str(data.get("reason", ""))[:200],
+        "alternatives": alternatives,
+    }
+
+
+def ai_categorize_merchant_sync(
+    merchant: str,
+    amount: float,
+    currency: str = "ILS",
+    card_prior: list[str] | None = None,
+    card_name: str | None = None,
+    fuzzy_hint: tuple[str, str, float] | None = None,
+) -> dict:
+    """
+    Synchronous wrapper for callers (e.g. the Flask /ingest handler) that
+    don't have a running event loop. Builds a fresh asyncio loop for the
+    one call — fine since this is invoked at most a few times per day.
+    """
+    return asyncio.run(
+        ai_categorize_merchant(
+            merchant=merchant,
+            amount=amount,
+            currency=currency,
+            card_prior=card_prior,
+            card_name=card_name,
+            fuzzy_hint=fuzzy_hint,
+        )
+    )

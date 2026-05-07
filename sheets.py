@@ -448,3 +448,196 @@ def log_expense(
         timestamp=timestamp,
         message=f"✅ Added ₪{amount:g} to '{category}'. New total: ₪{new_total:g}",
     )
+
+
+# ---------------------------------------------------------------------------
+# Merchants tab — sheet-backed merchant -> category map.
+#
+# Persisted in a hidden tab so it survives Render restarts (free disk is
+# ephemeral) and can be edited by hand. The tab is created lazily on first
+# write. Header layout:
+#
+#   merchant_normalized | category | source | first_seen | last_seen | hits
+#
+# - source = "user" (set by an inline-button tap) or "auto" (saved by the
+#   AI when its confidence cleared the threshold).
+# - hits is incremented every time a transaction matches this row.
+# ---------------------------------------------------------------------------
+
+MERCHANTS_TAB_NAME = "Merchants"
+_MERCHANTS_HEADERS = [
+    "merchant_normalized",
+    "category",
+    "source",
+    "first_seen",
+    "last_seen",
+    "hits",
+]
+
+
+def _ensure_merchants_tab(service) -> int:
+    """
+    Return the sheetId for the Merchants tab, creating it on demand.
+
+    Cached locally so we only call the metadata API once per process.
+    """
+    cached = getattr(_ensure_merchants_tab, "_cached_sheet_id", None)
+    if cached is not None:
+        return cached
+
+    metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    for s in metadata.get("sheets", []):
+        if s["properties"]["title"] == MERCHANTS_TAB_NAME:
+            sheet_id = s["properties"]["sheetId"]
+            _ensure_merchants_tab._cached_sheet_id = sheet_id  # type: ignore[attr-defined]
+            return sheet_id
+
+    add_resp = service.spreadsheets().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body={
+            "requests": [
+                {
+                    "addSheet": {
+                        "properties": {
+                            "title": MERCHANTS_TAB_NAME,
+                            "hidden": True,
+                            "gridProperties": {"rowCount": 1000, "columnCount": 6},
+                        }
+                    }
+                }
+            ]
+        },
+    ).execute()
+    sheet_id = add_resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{MERCHANTS_TAB_NAME}'!A1:F1",
+        valueInputOption="RAW",
+        body={"values": [_MERCHANTS_HEADERS]},
+    ).execute()
+    logger.info(f"Created hidden tab '{MERCHANTS_TAB_NAME}' for merchant map")
+
+    _ensure_merchants_tab._cached_sheet_id = sheet_id  # type: ignore[attr-defined]
+    return sheet_id
+
+
+def read_merchant_map() -> list[dict]:
+    """
+    Return all merchant->category rows as a list of dicts.
+
+    Returns [] if the tab doesn't exist yet (we don't auto-create on read,
+    only on first write — keeps reads cheap and side-effect-free).
+    """
+    service = _build_service()
+    metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    has_tab = any(
+        s["properties"]["title"] == MERCHANTS_TAB_NAME
+        for s in metadata.get("sheets", [])
+    )
+    if not has_tab:
+        return []
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{MERCHANTS_TAB_NAME}'!A2:F",
+    ).execute()
+    rows = result.get("values", [])
+
+    out: list[dict] = []
+    for r in rows:
+        # Pad to the full width so partial rows don't IndexError
+        r = (r + [""] * len(_MERCHANTS_HEADERS))[: len(_MERCHANTS_HEADERS)]
+        merchant, category, source, first_seen, last_seen, hits = r
+        if not merchant or not category:
+            continue
+        try:
+            hits_n = int(hits) if hits else 0
+        except ValueError:
+            hits_n = 0
+        out.append({
+            "merchant_normalized": merchant.strip(),
+            "category": category.strip(),
+            "source": source.strip() or "auto",
+            "first_seen": first_seen.strip(),
+            "last_seen": last_seen.strip(),
+            "hits": hits_n,
+        })
+    return out
+
+
+def upsert_merchant_mapping(
+    merchant_normalized: str,
+    category: str,
+    source: str = "user",
+) -> None:
+    """
+    Insert or update one merchant->category mapping.
+
+    On a hit: bumps `hits` and refreshes `last_seen`. If `source` upgrades
+    from 'auto' to 'user' (i.e. the user just confirmed an AI guess), the
+    new source overwrites; we never downgrade 'user' back to 'auto'.
+    """
+    if not merchant_normalized or not category:
+        return
+
+    service = _build_service()
+    _ensure_merchants_tab(service)
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{MERCHANTS_TAB_NAME}'!A2:F",
+    ).execute()
+    rows = result.get("values", [])
+
+    # Find existing row (1-based: header is row 1, first data row is row 2)
+    existing_row_index: Optional[int] = None
+    existing: list[str] = []
+    for i, r in enumerate(rows):
+        r_padded = (r + [""] * len(_MERCHANTS_HEADERS))[: len(_MERCHANTS_HEADERS)]
+        if r_padded[0].strip().lower() == merchant_normalized.lower():
+            existing_row_index = i + 2  # +2 because rows[] starts at sheet row 2
+            existing = r_padded
+            break
+
+    if existing_row_index is None:
+        new_row = [merchant_normalized, category, source, today, today, "1"]
+        service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{MERCHANTS_TAB_NAME}'!A:F",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [new_row]},
+        ).execute()
+        logger.info(f"Merchant map: added {merchant_normalized!r} -> {category!r} ({source})")
+        return
+
+    new_category = category
+    new_source = existing[2].strip() or source
+    if source == "user":
+        new_source = "user"  # explicit user confirmation always wins
+    new_first_seen = existing[3].strip() or today
+    try:
+        new_hits = int(existing[5]) + 1 if existing[5] else 1
+    except ValueError:
+        new_hits = 1
+
+    updated_row = [
+        merchant_normalized,
+        new_category,
+        new_source,
+        new_first_seen,
+        today,
+        str(new_hits),
+    ]
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{MERCHANTS_TAB_NAME}'!A{existing_row_index}:F{existing_row_index}",
+        valueInputOption="RAW",
+        body={"values": [updated_row]},
+    ).execute()
+    logger.info(
+        f"Merchant map: updated {merchant_normalized!r} -> {new_category!r} "
+        f"(source={new_source}, hits={new_hits})"
+    )

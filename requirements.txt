@@ -5,3 +5,5 @@ python-dotenv
 fuzzywuzzy
 python-Levenshtein
 openai
+flask>=3.0
+requests>=2.31
