@@ -51,23 +51,35 @@ def create_app() -> Flask:
 
     @app.post("/ingest")
     def ingest() -> Any:
-        # Auth
+        # Auth — accept Bearer header first, then ?secret= query param
+        # (the query-param form lets iOS Shortcuts work with a single
+        # "Get Contents of URL" action and no header configuration).
         if not INGEST_SECRET:
             logger.error("INGEST_SECRET is not set; refusing all /ingest requests.")
             return jsonify(status="error", detail="server not configured"), 503
 
         auth = request.headers.get("Authorization", "")
         token = auth.removeprefix("Bearer ").strip() if auth else ""
+        if not token:
+            token = request.args.get("secret", "").strip()
         if token != INGEST_SECRET:
             logger.warning("Bad auth on /ingest from %s", request.remote_addr)
             return jsonify(status="error", detail="unauthorized"), 401
 
-        # Parse JSON body (lenient — accept form-encoded too for Shortcut adapters)
+        # Parse the payload. Three sources, in priority order:
+        #   1. JSON body  (preferred; used by the Gmail Apps Script)
+        #   2. Form body  (for legacy form-encoded adapters)
+        #   3. URL query params (iOS Shortcut convenience — `body=...&issuer=...`)
+        # `secret` is excluded from the merged payload so it never reaches the
+        # parser, downstream logs, or the sheet note column.
         payload = request.get_json(silent=True) or {}
         if not payload and request.form:
             payload = request.form.to_dict()
         if not isinstance(payload, dict):
             return jsonify(status="error", detail="payload must be a JSON object"), 400
+        if not payload.get("body") and request.args:
+            args_payload = {k: v for k, v in request.args.items() if k != "secret"}
+            payload = {**args_payload, **payload}  # JSON/form wins over URL params
 
         issuer = (payload.get("issuer") or "isracard").strip().lower()
         if issuer not in ALLOWED_ISSUERS:

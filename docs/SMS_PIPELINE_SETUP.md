@@ -1,10 +1,19 @@
 # SMS / Email expense pipeline — setup guide
 
 This document is the one-time wiring for the credit-card-driven pipeline.
-Once these steps are done, swiping a card -> Isracard email -> Render
-server -> Google Sheet logs the expense. You only ever interact with the
-bot when a brand-new merchant appears AND the AI's confidence is below the
-threshold.
+Once these steps are done, swiping a card -> Isracard SMS (or email) ->
+Render server -> Google Sheet logs the expense. You only ever interact with
+the bot when a brand-new merchant appears AND the AI's confidence is below
+the threshold.
+
+Two ingestion channels are supported and can run side-by-side:
+
+  - **iOS Shortcut → SMS** (recommended; section 4A below)
+  - **Gmail Apps Script → email** (section 4B below)
+
+Both POST to the same `/ingest` endpoint; everything downstream is identical.
+Server-side dedupe handles the case where the same transaction arrives via
+both channels.
 
 Code: see `parsing/isracard_parser.py`, `handlers/transaction_handler.py`,
 `server.py`, `integrations/gmail_apps_script.gs`.
@@ -53,14 +62,80 @@ with, and put it in `OWNER_CHAT_ID` on Render. (If you skip this step the
 pipeline falls back to the first chat id in `subscribers.json`, which is
 fine in a single-user setup but explicit is safer.)
 
-## 3. Enable Isracard email alerts
+## 3. Enable Isracard transaction notifications
 
-In the Isracard app or website, turn on **email** notifications for
-transaction approvals. SMS can stay on too — the dedupe layer prevents
-double-logging if the same transaction arrives by both channels during the
-transition.
+In the Isracard app or website, make sure **SMS** transaction notifications
+are on (they're on by default). If you want email as a backup channel, turn
+that on too — the dedupe layer prevents double-logging when the same
+transaction arrives by both channels.
 
-## 4. Gmail setup
+## 4A. iOS Shortcut (recommended) — SMS direct to /ingest
+
+This is the simplest, fastest, and most reliable path on iOS 17+. The phone
+fires the Shortcut the moment an Isracard SMS arrives; the Shortcut POSTs
+the message body straight to your Render server; the bot replies with a
+confirmation in your normal Telegram chat.
+
+### One-time Shortcut setup
+
+1. Open **Shortcuts** → bottom tab **Automation** → **+** → **Message**.
+2. **Sender**: leave empty (some Israeli senders show as a short-code that
+   isn't easy to pin); rely on the text filter instead.
+3. **Message contains**: `ישראכרט`. (Optional but recommended; the parser
+   filters out non-Isracard messages anyway, but this saves a round-trip.)
+4. **Run Immediately**: ON. **Notify When Run**: your call (ON gives a
+   small "Running automation" banner per fire).
+5. Tap **Next** -> **New Blank Automation**.
+6. Add these four actions in order:
+
+   1. **Get text from Shortcut Input**
+      - The Shortcut Input on a Message trigger is the SMS body.
+   2. **URL Encode** (the *Text* variable from step 1; choose action **URL Encode**)
+   3. **Expand URL** (also called **Text** -> *URL* in some iOS versions; the action that lets you build a URL with magic variables interpolated):
+      ```
+      https://<your-render-host>/ingest?secret=<INGEST_SECRET>&issuer=isracard&body=<URL Encoded Text>
+      ```
+      Replace `<your-render-host>` and `<INGEST_SECRET>` with the real values.
+      The `<URL Encoded Text>` is the magic variable from step 2.
+   4. **Get Contents of URL** (the URL from step 3)
+      - **Method**: POST
+      - Headers: none needed
+      - Request Body: doesn't matter (everything's in the URL)
+
+That's it. Save the automation.
+
+### Verify
+
+1. Send yourself a regular SMS containing `ישראכרט אושרה עסקה test` from
+   any phone, or have someone else send it. Within a second the automation
+   fires and POSTs to `/ingest`. The body isn't a real Isracard message so
+   you'll get back `{"status": "error", "detail": "..."}` — and that's the
+   expected, safe outcome. Looking at it in the Shortcut's last-run details
+   confirms the round-trip works.
+2. Wait for a real card swipe. The Telegram bot should reply within seconds
+   with either an auto-log confirmation or a one-tap categorization ask.
+
+### Notes on this setup
+
+- **The secret rides in the URL**, which lands in Render's request log.
+  HTTPS still encrypts it on the wire. For a personal single-user tool this
+  is acceptable; rotate `INGEST_SECRET` on both Render and the Shortcut
+  whenever you want.
+- **The Authorization-header path still works** if you ever want to switch
+  to a more standard form: replace step 3's URL with a JSON body and add
+  `Authorization: Bearer <secret>` as a header in step 4. The server
+  accepts both.
+- **The Telegram bot stays uninvolved in the SMS hop.** Earlier you might
+  have built a Shortcut that called `api.telegram.org/bot.../sendMessage`
+  to make the bot post the SMS into the chat — that didn't work because
+  Telegram bots ignore their own messages and so the parser/log path was
+  never invoked. The new flow bypasses Telegram entirely on the way in;
+  Telegram is only the *output* channel for confirmations.
+
+## 4B. Gmail Apps Script (alternative / backup) — email to /ingest
+
+Use this if you can't get the iOS Shortcut working, or if you want a
+phone-independent backup channel running in parallel.
 
 1. Create two labels in Gmail:
    - `expense-bot/incoming`

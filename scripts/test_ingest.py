@@ -227,6 +227,55 @@ print(f"  non-isracard body    http={code}  status={data['status']}")
 code, data = _post({"issuer": "max", "body": bodies["B.4881.gett"], "message_id": "w"})
 print(f"  disallowed issuer    http={code}  status={data['status']}")
 
+# 6. URL-param style (iOS Shortcut shape) — secret + body in the URL, no auth header.
+from urllib.parse import quote_plus  # noqa: E402
+
+ios_body = bodies["A.0347.terminalx"]
+ios_url = (
+    f"http://127.0.0.1:{PORT}/ingest"
+    f"?secret=test-secret"
+    f"&issuer=isracard"
+    f"&body={quote_plus(ios_body)}"
+)
+ios_req = urlreq.Request(ios_url, data=b"", method="POST")
+try:
+    with urlreq.urlopen(ios_req, timeout=5) as resp:
+        ios_code, ios_data = resp.status, json.loads(resp.read())
+except urlerr.HTTPError as e:
+    ios_code, ios_data = e.code, json.loads(e.read())
+print(f"  iOS URL-param style  http={ios_code}  status={ios_data['status']}  cat={ios_data.get('category') or '—'}")
+assert ios_data["status"] == "duplicate", \
+    f"expected duplicate (terminalx already logged above) but got {ios_data['status']}"
+
+# 7. URL-param with WRONG ?secret= must reject
+bad_secret_url = (
+    f"http://127.0.0.1:{PORT}/ingest?secret=NOPE&issuer=isracard&body=hello"
+)
+try:
+    with urlreq.urlopen(urlreq.Request(bad_secret_url, data=b"", method="POST"), timeout=5) as resp:
+        bad_code = resp.status
+except urlerr.HTTPError as e:
+    bad_code = e.code
+print(f"  iOS URL bad secret   http={bad_code}")
+assert bad_code == 401, f"expected 401, got {bad_code}"
+
+# 8. URL-param with secret in URL but a NEW message via the body param — should log/ask cleanly
+fresh_body = bodies["A.4888.golda"].replace("בסך 153.65", "בסך 199.99")  # change amount so dedupe doesn't trigger
+fresh_url = (
+    f"http://127.0.0.1:{PORT}/ingest"
+    f"?secret=test-secret"
+    f"&issuer=isracard"
+    f"&body={quote_plus(fresh_body)}"
+)
+try:
+    with urlreq.urlopen(urlreq.Request(fresh_url, data=b"", method="POST"), timeout=5) as resp:
+        fresh_code, fresh_data = resp.status, json.loads(resp.read())
+except urlerr.HTTPError as e:
+    fresh_code, fresh_data = e.code, json.loads(e.read())
+print(f"  iOS URL fresh txn    http={fresh_code}  status={fresh_data['status']}  cat={fresh_data.get('category') or '—'}")
+assert fresh_data["status"] in ("logged", "asked"), \
+    f"expected logged or asked, got {fresh_data['status']}"
+
 # --- Summary ---
 print("\nSummary:")
 print(f"  /ingest calls reaching parse: {len(results)}")
