@@ -102,7 +102,9 @@ def create_app() -> Flask:
             "amount_ils": result.amount_ils,
             "merchant": result.merchant,
         }
-        http_code = 200 if result.status in ("logged", "asked", "skipped", "duplicate") else 400
+        http_code = 200 if result.status in (
+            "logged", "asked", "skipped", "duplicate", "ignored",
+        ) else 400
         return jsonify(body), http_code
 
     return app

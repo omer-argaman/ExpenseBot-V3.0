@@ -18,7 +18,7 @@ from pathlib import Path
 # Allow running as a script from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from parsing.isracard_parser import parse  # noqa: E402
+from parsing.isracard_parser import looks_like_transaction_notification, parse, looks_like_isracard  # noqa: E402
 
 # Anchored "now" so the year-rollover heuristic is deterministic.
 NOW = datetime(2026, 5, 7, 10, 0)
@@ -116,6 +116,15 @@ def main() -> int:
     if failures:
         print("Failed:", failures)
         return 1
+
+    # --- Transaction-vs-marketing filter --------------------------------
+    assert not looks_like_isracard("some random text")
+    assert not looks_like_transaction_notification(
+        "ישראכרט מזמינים אותך לבדוק את המבצעים שלנו באפליקציה"
+    )
+    assert looks_like_transaction_notification(SAMPLES[0][1])  # billabong charge
+
+    print("\nTransaction-notification filter: OK")
     return 0
 
 

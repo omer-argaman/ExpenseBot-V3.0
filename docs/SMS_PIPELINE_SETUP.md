@@ -104,16 +104,36 @@ confirmation in your normal Telegram chat.
 
 That's it. Save the automation.
 
+### Trigger vs. server-side relevance
+
+Your automation trigger can stay broad (e.g. **Message contains** `ישראכרט`).
+That catches **marketing** and **reminders** too. On the server we only
+continue if the text looks like a **real card event**: it must contain
+`ישראכרט` **and** one of:
+
+- `אושרה עסקה` (approved purchase — almost all charges), or  
+- a **declined** phrase (`נדחתה`, `לא אושרה`, …), or  
+- a **refund / reversal** phrase (`זיכוי`, `בוטלה`, …).
+
+Anything else (promos, “download our app”, generic notices) returns HTTP 200
+with `{"status":"ignored","detail":"not_a_transaction_notification"}` —
+no sheet write, no Telegram, no OpenAI. You’ll still see one line in Render
+logs at INFO level.
+
+**Optional iOS tightening:** you could set **Message contains** to
+`ישראכרט אושרה` so fewer irrelevant SMS fire the Shortcut — but you might
+miss rare decline/refund wordings. Recommended: keep the broad trigger and
+let the server filter noise.
+
 ### Verify
 
-1. Send yourself a regular SMS containing `ישראכרט אושרה עסקה test` from
-   any phone, or have someone else send it. Within a second the automation
-   fires and POSTs to `/ingest`. The body isn't a real Isracard message so
-   you'll get back `{"status": "error", "detail": "..."}` — and that's the
-   expected, safe outcome. Looking at it in the Shortcut's last-run details
-   confirms the round-trip works.
-2. Wait for a real card swipe. The Telegram bot should reply within seconds
-   with either an auto-log confirmation or a one-tap categorization ask.
+1. Send yourself an SMS that mentions Isracard **without** an approval line,
+   e.g. `ישראכרט מבצע מיוחד`. `/ingest` should respond with
+   `status: ignored` — no Telegram message.
+2. Send yourself `ישראכרט אושרה עסקה test` — passes the relevance gate but
+   isn’t a parseable charge; you may still get an error-style response or no
+   log (depending on parser); that confirms the POST path works.
+3. Wait for a real card swipe — Telegram should confirm or ask within seconds.
 
 ### Notes on this setup
 

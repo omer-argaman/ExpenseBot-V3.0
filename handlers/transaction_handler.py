@@ -129,7 +129,7 @@ def pop_pending(pending_id: str) -> Optional[PendingAsk]:
 
 @dataclass
 class IngestResult:
-    status: str          # "logged" | "asked" | "skipped" | "duplicate" | "error"
+    status: str          # "logged" | "asked" | "skipped" | "duplicate" | "ignored" | "error"
     detail: str = ""
     category: Optional[str] = None
     amount_ils: Optional[float] = None
@@ -166,6 +166,18 @@ def process_ingest(payload: dict[str, Any]) -> IngestResult:
         return IngestResult(
             status="error",
             detail="body does not look like an Isracard message",
+        )
+
+    # Marketing / reminders often contain `ישראכרט` but not `אושרה עסקה` or
+    # any decline/refund anchor. Skip silently — no Telegram, no AI, no sheet.
+    if not isracard_parser.looks_like_transaction_notification(body):
+        logger.info(
+            "Ignoring non-transaction Isracard SMS (no charge/decline/refund anchor): %s",
+            body[:160].replace("\n", " "),
+        )
+        return IngestResult(
+            status="ignored",
+            detail="not_a_transaction_notification",
         )
 
     txn = isracard_parser.parse(body)

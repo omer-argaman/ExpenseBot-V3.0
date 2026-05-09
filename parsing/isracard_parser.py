@@ -111,6 +111,32 @@ def looks_like_isracard(text: str) -> bool:
     return bool(text) and _ISSUER_TOKEN in text
 
 
+def looks_like_transaction_notification(text: str) -> bool:
+    """
+    True when the SMS is likely a real card event (approved charge, decline,
+    or refund), not generic Isracard marketing / reminders that only mention
+    the brand name.
+
+    The iOS Shortcut trigger often matches any SMS containing `ישראכרט`;
+    this gate drops promos and info messages **before** any AI or Telegram
+    noise. Requires the issuer token plus at least one transaction anchor:
+      - `אושרה עסקה` — approved purchase (most common)
+      - decline tokens — `נדחתה`, `לא אושרה`, …
+      - refund tokens — `זיכוי`, `בוטלה`, …
+    """
+    if not looks_like_isracard(text):
+        return False
+    if _CHARGE_TOKEN in text:
+        return True
+    for t in _DECLINED_TOKENS:
+        if t in text:
+            return True
+    for t in _REFUND_TOKENS:
+        if t in text:
+            return True
+    return False
+
+
 def parse(text: str, now: Optional[datetime] = None) -> Transaction:
     """
     Parse the body of an Isracard message into a `Transaction`.
