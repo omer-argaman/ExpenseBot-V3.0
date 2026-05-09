@@ -182,6 +182,21 @@ def process_ingest(payload: dict[str, Any]) -> IngestResult:
 
     txn = isracard_parser.parse(body)
 
+    # Defense-in-depth: manual tests / jokes / truncated forwards often contain
+    # `ישראכרט` but never formed a charge sentence — parser yields kind=unknown.
+    # Never spam Telegram for those; real charges always include אושרה עסקה
+    # upstream (looks_like_transaction_notification) but this catches edge cases
+    # (encoding, older deploys, odd Unicode).
+    if txn.kind == "unknown":
+        logger.info(
+            "Ignoring message — parser saw no charge/decline/refund sentence: %s",
+            body[:160].replace("\n", " "),
+        )
+        return IngestResult(
+            status="ignored",
+            detail="unknown_transaction_kind",
+        )
+
     if txn.kind == "declined":
         logger.info("Skipping declined transaction: %s", txn.merchant_raw)
         return IngestResult(status="skipped", detail="declined")

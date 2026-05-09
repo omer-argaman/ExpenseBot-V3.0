@@ -225,3 +225,31 @@ Same as today: push to GitHub, Render auto-deploys. The new dependency
 - **New issuer** — add a `parsing/<issuer>_parser.py` and a one-line
   dispatcher; everything else (card registry, merchant map, AI, Telegram
   flow) is issuer-agnostic.
+
+## 8. Troubleshooting
+
+### `telegram.error.Conflict: terminated by other getUpdates request`
+
+Telegram only allows **one** client per bot token to call `getUpdates` (long
+polling). If two processes use the same token, they fight and you see this
+error.
+
+Typical causes:
+
+- The bot runs on **Render** but you also started `python bot.py` **locally**
+  — stop the local process.
+- Two **Render web services** both run this repo with the same
+  `TELEGRAM_BOT_TOKEN` — remove or pause the duplicate.
+
+Fix: ensure **exactly one** running instance polls Telegram with your bot token.
+
+### Junk SMS like `ישראכרט 536678` caused Telegram noise / HTTP 400
+
+That text mentions Isracard but is **not** a real transaction SMS (no
+`אושרה עסקה`, decline, or refund wording). The server should respond with
+HTTP **200** and `{"status":"ignored"}` — **no** Telegram message.
+
+If you still get `Couldn't parse this Isracard message...`, your Render
+service is probably running an **older** deploy — check the dashboard that
+the latest commit from `main` deployed successfully, then **Manual Deploy**
+if needed.
