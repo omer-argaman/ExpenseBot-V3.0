@@ -37,7 +37,7 @@ from handlers.commands import (
     BROAD_CATEGORIES,
 )
 from handlers.ai_handler import explain_sheet_missing
-from handlers.transaction_handler import peek_pending, pop_pending
+from handlers.transaction_handler import peek_pending, pop_pending, reload_pending_from_sheet
 
 _EXPIRED_MSG = (
     "This category prompt expired (bot restarted or it's older than 24h). "
@@ -224,6 +224,8 @@ async def _handle_txn_callback(query, data: str) -> None:
 
     if action == "more":
         if peek_pending(pending_id) is None:
+            reload_pending_from_sheet(pending_id)
+        if peek_pending(pending_id) is None:
             await query.edit_message_text(_EXPIRED_MSG)
             return
         keyboard = _expanded_category_keyboard(pending_id)
@@ -238,6 +240,9 @@ async def _handle_txn_callback(query, data: str) -> None:
             return
         ask = peek_pending(pending_id)
         if ask is None:
+            reload_pending_from_sheet(pending_id)
+            ask = peek_pending(pending_id)
+        if ask is None:
             await query.edit_message_text(_EXPIRED_MSG)
             return
         if index < 0 or index >= len(ask.candidates):
@@ -251,8 +256,14 @@ async def _handle_txn_callback(query, data: str) -> None:
 
 
 async def _commit_txn(query, pending_id: str, category: str) -> None:
+    from _debug_trace import dbg  # noqa: PLC0415
+
+    dbg("H5", "callbacks._commit_txn", "enter", {"pending_id": pending_id, "category": category})
     ask = peek_pending(pending_id)
     if ask is None:
+        ask = reload_pending_from_sheet(pending_id)
+    if ask is None:
+        dbg("H5", "callbacks._commit_txn", "expired", {"pending_id": pending_id})
         await query.edit_message_text(_EXPIRED_MSG)
         return
 
@@ -281,6 +292,7 @@ async def _commit_txn(query, pending_id: str, category: str) -> None:
         return
 
     pop_pending(pending_id)
+    dbg("H5", "callbacks._commit_txn", "logged_ok", {"pending_id": pending_id})
 
     append_to_history(
         category=log_result.category,

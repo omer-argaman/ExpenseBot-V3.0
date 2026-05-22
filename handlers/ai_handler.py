@@ -822,10 +822,14 @@ def ai_categorize_merchant_sync(
 ) -> dict:
     """
     Synchronous wrapper for callers (e.g. the Flask /ingest handler) that
-    don't have a running event loop. Builds a fresh asyncio loop for the
-    one call — fine since this is invoked at most a few times per day.
+    don't have a running event loop. Uses a shared background loop instead
+    of asyncio.run() per call to avoid event-loop / httpx leaks.
     """
-    return asyncio.run(
+    from _debug_trace import dbg  # noqa: PLC0415
+    from handlers.async_runner import run_coro
+
+    dbg("H1", "ai_handler.ai_categorize_merchant_sync", "enter", {"merchant_len": len(merchant)})
+    result = run_coro(
         ai_categorize_merchant(
             merchant=merchant,
             amount=amount,
@@ -835,3 +839,7 @@ def ai_categorize_merchant_sync(
             fuzzy_hint=fuzzy_hint,
         )
     )
+    dbg("H1", "ai_handler.ai_categorize_merchant_sync", "exit", {
+        "confidence": result.get("confidence"),
+    })
+    return result

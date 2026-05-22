@@ -112,6 +112,9 @@ class LogResult:
 # ---------------------------------------------------------------------------
 
 _service_cache = None
+_tabs_cache: tuple[float, dict[str, tuple[str, int]]] | None = None
+_TABS_CACHE_TTL_SECONDS = 300
+_MAX_NOTE_CHARS = 12_000  # cap cell notes to limit read/write memory per log
 
 def _build_service():
     global _service_cache
@@ -129,6 +132,12 @@ def _build_service():
 # Tab resolution
 # ---------------------------------------------------------------------------
 
+def invalidate_spreadsheet_tabs_cache() -> None:
+    """Clear cached tab metadata (e.g. after adding a new sheet)."""
+    global _tabs_cache
+    _tabs_cache = None
+
+
 def get_spreadsheet_tabs(service) -> dict[str, tuple[str, int]]:
     """
     Fetch all sheet tab titles once and return a lookup dict.
@@ -136,14 +145,29 @@ def get_spreadsheet_tabs(service) -> dict[str, tuple[str, int]]:
     Use this when you need to resolve multiple months — it avoids a metadata
     API call for every individual month lookup.
     """
+    global _tabs_cache
+    import time as _time
+    from _debug_trace import dbg  # noqa: PLC0415
+
+    now = _time.monotonic()
+    if _tabs_cache is not None:
+        cached_at, tabs = _tabs_cache
+        if now - cached_at < _TABS_CACHE_TTL_SECONDS:
+            dbg("H2", "sheets.get_spreadsheet_tabs", "cache_hit", {"age_s": round(now - cached_at, 1)})
+            return tabs
+
+    dbg("H2", "sheets.get_spreadsheet_tabs", "cache_miss_fetch")
     metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-    return {
+    tabs = {
         s["properties"]["title"].lower(): (
             s["properties"]["title"],
             s["properties"]["sheetId"],
         )
         for s in metadata.get("sheets", [])
     }
+    _tabs_cache = (now, tabs)
+    dbg("H2", "sheets.get_spreadsheet_tabs", "cache_stored", {"tab_count": len(tabs)})
+    return tabs
 
 
 def _normalize(s: str) -> str:
@@ -388,6 +412,9 @@ def log_expense(
     if dt is None:
         dt = datetime.now()
 
+    from _debug_trace import dbg  # noqa: PLC0415
+
+    dbg("H2", "sheets.log_expense", "enter", {"category": category, "amount": amount})
     service = _build_service()
 
     # 1. Find the right month tab — fetch tabs once so we can build a rich
@@ -433,9 +460,19 @@ def log_expense(
 
     # 4. Build the note line with a shared timestamp, then append it
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    from _debug_trace import dbg  # noqa: PLC0415
+
     existing_note = _read_existing_note(service, tab_name, row)
+    dbg("H3", "sheets.log_expense", "note_read", {
+        "existing_note_len": len(existing_note),
+        "category": category,
+    })
     new_line = _build_note_line(original_text, timestamp)
     full_note = (existing_note + "\n" + new_line).strip()
+    if len(full_note) > _MAX_NOTE_CHARS:
+        lines = full_note.split("\n")
+        full_note = "\n".join(lines[-50:]).strip()
+        dbg("H3", "sheets.log_expense", "note_truncated", {"kept_lines": 50})
     _write_note(service, tab_name, row, sheet_id, full_note)
 
     return LogResult(
@@ -448,6 +485,7 @@ def log_expense(
         timestamp=timestamp,
         message=f"✅ Added ₪{amount:g} to '{category}'. New total: ₪{new_total:g}",
     )
+    dbg("H2", "sheets.log_expense", "exit", {"success": True, "tab": tab_name})
 
 
 # ---------------------------------------------------------------------------
@@ -530,12 +568,8 @@ def read_merchant_map() -> list[dict]:
     only on first write — keeps reads cheap and side-effect-free).
     """
     service = _build_service()
-    metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-    has_tab = any(
-        s["properties"]["title"] == MERCHANTS_TAB_NAME
-        for s in metadata.get("sheets", [])
-    )
-    if not has_tab:
+    tabs = get_spreadsheet_tabs(service)
+    if MERCHANTS_TAB_NAME.lower() not in tabs:
         return []
 
     result = service.spreadsheets().values().get(
@@ -708,12 +742,8 @@ def _ensure_pending_tab(service) -> int:
 def read_pending_asks() -> list[dict]:
     """Return all pending-ask rows. [] if tab missing."""
     service = _build_service()
-    metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-    has_tab = any(
-        s["properties"]["title"] == PENDING_TAB_NAME
-        for s in metadata.get("sheets", [])
-    )
-    if not has_tab:
+    tabs = get_spreadsheet_tabs(service)
+    if PENDING_TAB_NAME.lower() not in tabs:
         return []
 
     result = service.spreadsheets().values().get(
@@ -814,14 +844,11 @@ def delete_pending_ask(pending_id: str) -> None:
         return
 
     service = _build_service()
-    metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-    sheet_id = None
-    for s in metadata.get("sheets", []):
-        if s["properties"]["title"] == PENDING_TAB_NAME:
-            sheet_id = s["properties"]["sheetId"]
-            break
-    if sheet_id is None:
+    tabs = get_spreadsheet_tabs(service)
+    tab_info = tabs.get(PENDING_TAB_NAME.lower())
+    if not tab_info:
         return
+    _, sheet_id = tab_info
 
     result = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,

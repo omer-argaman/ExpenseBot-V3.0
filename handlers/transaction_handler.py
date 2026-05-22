@@ -133,10 +133,17 @@ def _pending_row_from_ask(ask: PendingAsk) -> dict:
 
 
 def _sync_pending_to_sheet(ask: PendingAsk) -> None:
+    from _debug_trace import dbg  # noqa: PLC0415
+
+    dbg("H4", "transaction_handler._sync_pending_to_sheet", "enter", {
+        "pending_id": ask.pending_id,
+    })
     try:
         upsert_pending_ask(_pending_row_from_ask(ask))
+        dbg("H4", "transaction_handler._sync_pending_to_sheet", "ok")
     except Exception as exc:
         logger.warning("Could not write Pending tab for %s: %s", ask.pending_id, exc)
+        dbg("H4", "transaction_handler._sync_pending_to_sheet", "failed", {"err": str(exc)[:120]})
 
 
 def _delete_pending_from_sheet(pending_id: str) -> None:
@@ -185,6 +192,26 @@ def store_pending(ask: PendingAsk) -> None:
 def peek_pending(pending_id: str) -> Optional[PendingAsk]:
     with _pending_lock:
         return _pending.get(pending_id)
+
+
+def reload_pending_from_sheet(pending_id: str) -> Optional[PendingAsk]:
+    """Reload one pending ask from Sheets after a process restart."""
+    from _debug_trace import dbg  # noqa: PLC0415
+
+    try:
+        rows = read_pending_asks()
+    except Exception as exc:
+        dbg("H5", "transaction_handler.reload_pending", "read_failed", {"err": str(exc)[:120]})
+        return None
+    for row in rows:
+        if row.get("pending_id") == pending_id:
+            ask = _ask_from_row(row)
+            with _pending_lock:
+                _pending[pending_id] = ask
+            dbg("H5", "transaction_handler.reload_pending", "restored", {"pending_id": pending_id})
+            return ask
+    dbg("H5", "transaction_handler.reload_pending", "not_in_sheet", {"pending_id": pending_id})
+    return None
 
 
 def pop_pending(pending_id: str) -> Optional[PendingAsk]:
@@ -241,9 +268,12 @@ def process_ingest(payload: dict[str, Any]) -> IngestResult:
         "received_at":  <ISO8601 timestamp string, optional>
       }
     """
+    from _debug_trace import dbg  # noqa: PLC0415
+
     issuer = (payload.get("issuer") or "").strip().lower()
     body = (payload.get("body") or "").strip()
     message_id = (payload.get("message_id") or "").strip()
+    dbg("H1", "transaction_handler.process_ingest", "enter", {"message_id": message_id[:32]})
 
     if not body:
         return IngestResult(status="error", detail="empty body")
