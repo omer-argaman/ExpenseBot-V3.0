@@ -22,16 +22,17 @@ Flow:
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
-from config import HIGH_CONFIDENCE_THRESHOLD
+from config import HIGH_CONFIDENCE_THRESHOLD, IGNORED_CARDS
 from handlers.commands import append_to_history
 from handlers.notifier import send_message
 from handlers.ai_handler import ai_categorize_merchant_sync
@@ -43,7 +44,12 @@ from parsing.merchant_map import (
     learn as learn_merchant,
     lookup as lookup_merchant,
 )
-from sheets import log_expense
+from sheets import (
+    delete_pending_ask,
+    log_expense,
+    read_pending_asks,
+    upsert_pending_ask,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,23 +110,109 @@ class PendingAsk:
             self.candidates = []
 
 
+_PENDING_TTL_SECONDS = 24 * 60 * 60
+
 _pending_lock = threading.Lock()
 _pending: dict[str, PendingAsk] = {}
+
+
+def _pending_row_from_ask(ask: PendingAsk) -> dict:
+    txn_date_iso = ""
+    if ask.txn_date:
+        txn_date_iso = ask.txn_date.date().isoformat() if hasattr(ask.txn_date, "date") else str(ask.txn_date)
+    return {
+        "pending_id": ask.pending_id,
+        "merchant_normalized": ask.merchant_normalized,
+        "merchant_raw": ask.merchant_raw,
+        "amount_ils": ask.amount_ils,
+        "txn_date_iso": txn_date_iso,
+        "sheet_note": ask.sheet_note,
+        "candidates_json": json.dumps(ask.candidates or [], ensure_ascii=False),
+        "created_at": ask.created_at,
+    }
+
+
+def _sync_pending_to_sheet(ask: PendingAsk) -> None:
+    try:
+        upsert_pending_ask(_pending_row_from_ask(ask))
+    except Exception as exc:
+        logger.warning("Could not write Pending tab for %s: %s", ask.pending_id, exc)
+
+
+def _delete_pending_from_sheet(pending_id: str) -> None:
+    try:
+        delete_pending_ask(pending_id)
+    except Exception as exc:
+        logger.warning("Could not delete Pending tab row %s: %s", pending_id, exc)
+
+
+def _ask_from_row(row: dict) -> PendingAsk:
+    txn_date = None
+    iso = row.get("txn_date_iso") or ""
+    if iso:
+        try:
+            txn_date = datetime.strptime(iso, "%Y-%m-%d")
+        except ValueError:
+            pass
+    try:
+        candidates = json.loads(row.get("candidates_json") or "[]")
+    except json.JSONDecodeError:
+        candidates = []
+    return PendingAsk(
+        pending_id=row["pending_id"],
+        merchant_normalized=row.get("merchant_normalized", ""),
+        merchant_raw=row.get("merchant_raw", ""),
+        amount_ils=float(row.get("amount_ils", 0)),
+        txn_date=txn_date,
+        sheet_note=row.get("sheet_note", ""),
+        created_at=float(row.get("created_at", 0)),
+        candidates=candidates if isinstance(candidates, list) else [],
+    )
 
 
 def store_pending(ask: PendingAsk) -> None:
     with _pending_lock:
         _pending[ask.pending_id] = ask
-        # Evict anything older than 24h to bound memory
-        cutoff = time.time() - 24 * 60 * 60
+        cutoff = time.time() - _PENDING_TTL_SECONDS
         for pid in list(_pending.keys()):
             if _pending[pid].created_at < cutoff:
-                _pending.pop(pid, None)
+                expired = _pending.pop(pid, None)
+                if expired:
+                    _delete_pending_from_sheet(pid)
+    _sync_pending_to_sheet(ask)
+
+
+def peek_pending(pending_id: str) -> Optional[PendingAsk]:
+    with _pending_lock:
+        return _pending.get(pending_id)
 
 
 def pop_pending(pending_id: str) -> Optional[PendingAsk]:
     with _pending_lock:
-        return _pending.pop(pending_id, None)
+        ask = _pending.pop(pending_id, None)
+    if ask is not None:
+        _delete_pending_from_sheet(pending_id)
+    return ask
+
+
+def preload_pending_asks() -> int:
+    """Load non-expired pending asks from Sheets into memory."""
+    cutoff = time.time() - _PENDING_TTL_SECONDS
+    try:
+        rows = read_pending_asks()
+    except Exception as exc:
+        logger.warning("Could not read Pending tab; starting empty. (%s)", exc)
+        return 0
+    loaded = 0
+    with _pending_lock:
+        for row in rows:
+            if row.get("created_at", 0) < cutoff:
+                _delete_pending_from_sheet(row["pending_id"])
+                continue
+            ask = _ask_from_row(row)
+            _pending[ask.pending_id] = ask
+            loaded += 1
+    return loaded
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +293,7 @@ def process_ingest(payload: dict[str, Any]) -> IngestResult:
         logger.info("Skipping declined transaction: %s", txn.merchant_raw)
         return IngestResult(status="skipped", detail="declined")
 
-    if not txn.is_loggable and txn.kind != "refund":
-        # Could not parse enough to log. Forward raw body to the user so they
-        # can either log manually or send us the format change.
+    if not txn.is_actionable and txn.kind != "refund":
         send_message(
             "Couldn't parse this Isracard message; please log it manually:\n\n"
             f"<code>{_html_escape(body[:500])}</code>"
@@ -211,6 +301,10 @@ def process_ingest(payload: dict[str, Any]) -> IngestResult:
         return IngestResult(status="error", detail="parser could not extract fields")
 
     last4 = txn.last4 or ""
+
+    if last4 in IGNORED_CARDS:
+        logger.info("Ignoring transaction on card %s (IGNORED_CARDS)", last4)
+        return IngestResult(status="ignored", detail=f"ignored_card_{last4}")
     amount_native = txn.amount or 0.0
     currency = txn.currency or "ILS"
     sign = -1 if txn.kind == "refund" else 1
@@ -253,8 +347,27 @@ def process_ingest(payload: dict[str, Any]) -> IngestResult:
         fx_note=fx_note,
     )
 
-    # 1. Merchant map first
+    card = lookup_card(last4)
     merchant_norm = txn.merchant_normalized or ""
+
+    # No merchant in SMS — always ask the user (skip map/AI auto-log).
+    if not merchant_norm:
+        return _ask_user(
+            txn=txn,
+            amount_ils=amount_ils,
+            amount_native=amount_native,
+            currency=currency,
+            sign=sign,
+            sheet_note=sheet_note,
+            category_guess=None,
+            alternatives=[],
+            confidence=0.0,
+            reason="No merchant name in SMS.",
+            card=card,
+            display_merchant="Unknown merchant",
+        )
+
+    # 1. Merchant map first
     map_hit = lookup_merchant(merchant_norm)
     if map_hit and (
         map_hit.method == "exact"
@@ -276,7 +389,6 @@ def process_ingest(payload: dict[str, Any]) -> IngestResult:
         )
 
     # 2. AI categorization with card prior
-    card = lookup_card(last4)
     fuzzy_hint = None
     if map_hit and map_hit.method == "fuzzy":
         fuzzy_hint = (map_hit.merchant_normalized, map_hit.category, map_hit.confidence)
@@ -436,6 +548,7 @@ def _ask_user(
     confidence: float,
     reason: str,
     card,
+    display_merchant: Optional[str] = None,
 ) -> IngestResult:
     """Send a Telegram inline-keyboard prompt and stash a pending entry."""
     pending_id = uuid.uuid4().hex[:10]
@@ -443,16 +556,16 @@ def _ask_user(
         datetime(txn.txn_date.year, txn.txn_date.month, txn.txn_date.day)
         if txn.txn_date else None
     )
+    merchant_display = display_merchant or txn.merchant_raw or "Unknown merchant"
     ask = PendingAsk(
         pending_id=pending_id,
         merchant_normalized=txn.merchant_normalized or "",
-        merchant_raw=txn.merchant_raw or "",
+        merchant_raw=merchant_display if display_merchant else (txn.merchant_raw or ""),
         amount_ils=sign * amount_ils,
         txn_date=log_dt,
         sheet_note=sheet_note,
         created_at=time.time(),
     )
-    store_pending(ask)
 
     # Build candidate buttons: guess first, then alternatives, then card prior fillers
     candidates: list[str] = []
@@ -465,6 +578,8 @@ def _ask_user(
         if prior_cat not in candidates:
             candidates.append(prior_cat)
     candidates = candidates[:4]
+    ask.candidates = candidates
+    store_pending(ask)
 
     keyboard: list[list[dict]] = []
     for cat in candidates:
@@ -490,7 +605,7 @@ def _ask_user(
     reason_line = f"\n<i>{_html_escape(reason)}</i>" if reason else ""
 
     text = (
-        f"{sign_emoji} <b>{_html_escape(txn.merchant_raw or 'Unknown merchant')}</b>\n"
+        f"{sign_emoji} <b>{_html_escape(merchant_display)}</b>\n"
         f"{abs(ask.amount_ils):g} ILS"
         + (f" • card {txn.last4}" if txn.last4 else "")
         + fx_label
@@ -498,8 +613,6 @@ def _ask_user(
         + reason_line
         + "\n\nWhich category?"
     )
-
-    ask.candidates = candidates
 
     msg_id = send_message(text, inline_keyboard=keyboard)
     if msg_id is None:

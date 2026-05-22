@@ -9,6 +9,7 @@ when business logic changes.
 """
 
 import logging
+import resource
 from datetime import datetime, time as dt_time, timedelta
 
 from telegram import Update
@@ -22,6 +23,8 @@ from telegram.ext import (
 )
 
 from config import ISRAEL_TZ, TELEGRAM_BOT_TOKEN
+from parsing.merchant_map import preload as preload_merchant_map
+from handlers.transaction_handler import preload_pending_asks
 from handlers.callbacks import handle_callback
 from handlers.commands import (
     tg_balance,
@@ -70,23 +73,58 @@ async def tg_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # drops the history of anyone idle for more than IDLE_THRESHOLD_DAYS.
 
 IDLE_THRESHOLD_DAYS = 2
+_rss_log_counter = 0
+
+
+def _log_memory_rss() -> None:
+    """Log process RSS (KB) for Render memory monitoring."""
+    try:
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # macOS reports bytes; Linux reports KB
+        import sys
+        if sys.platform == "darwin":
+            rss_kb = rss_kb // 1024
+        logger.info("Memory RSS: %d MB", rss_kb // 1024)
+    except Exception as exc:
+        logger.debug("Could not read RSS: %s", exc)
 
 
 async def _cleanup_idle_users(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Drop ai_history for users who haven't messaged in IDLE_THRESHOLD_DAYS."""
+    """Drop idle user_data dicts to limit PTB per-chat memory growth."""
+    global _rss_log_counter
     cutoff = (datetime.now() - timedelta(days=IDLE_THRESHOLD_DAYS)).timestamp()
     cleaned = 0
-    for user_data in context.application.user_data.values():
+    to_remove: list[int] = []
+    for chat_id, user_data in list(context.application.user_data.items()):
         last_seen = user_data.get("last_seen", 0)
-        if last_seen < cutoff and user_data.get("ai_history"):
-            user_data.pop("ai_history", None)
+        if last_seen < cutoff:
+            to_remove.append(chat_id)
             cleaned += 1
+    for chat_id in to_remove:
+        context.application.user_data.pop(chat_id, None)
     if cleaned:
-        logger.info(f"Idle-cleanup: dropped ai_history for {cleaned} idle user(s)")
+        logger.info(
+            "Idle-cleanup: removed user_data for %d idle chat(s)", cleaned
+        )
+    _rss_log_counter += 1
+    if _rss_log_counter % 7 == 0:
+        _log_memory_rss()
 
 
 async def _post_init(application: Application) -> None:
     """Register scheduled jobs after the Application is fully initialised."""
+    try:
+        n_merchants = preload_merchant_map()
+        logger.info("Startup: merchant map preloaded (%d entries)", n_merchants)
+    except Exception as exc:
+        logger.warning("Startup: merchant map preload failed: %s", exc)
+    try:
+        n_pending = preload_pending_asks()
+        logger.info("Startup: pending asks preloaded (%d entries)", n_pending)
+    except Exception as exc:
+        logger.warning("Startup: pending asks preload failed: %s", exc)
+    _log_memory_rss()
+
     application.job_queue.run_monthly(
         send_monthly_report,
         when=dt_time(hour=9, minute=0, second=0, tzinfo=ISRAEL_TZ),

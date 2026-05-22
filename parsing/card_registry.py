@@ -42,17 +42,19 @@ class CardInfo:
 
 # Hard-coded baseline. Override via the CARD_PRIORS env var (JSON).
 DEFAULT_REGISTRY: dict[str, CardInfo] = {
+    # 0347 is ignored at ingest (IGNORED_CARDS); entry kept for CARD_PRIORS overrides.
     "0347": CardInfo(
         last4="0347",
-        name="Isracard prepaid - clothing/appliances",
+        name="Isracard prepaid - clothing/appliances (ignored)",
         is_prepaid=True,
-        category_prior=("Other (Daily)", "Maintenance/Improvements", "Entertainment"),
+        category_prior=(),
     ),
+    # 4888 is ignored at ingest (IGNORED_CARDS); entry kept for CARD_PRIORS overrides.
     "4888": CardInfo(
         last4="4888",
-        name="Isracard prepaid - food",
+        name="Isracard prepaid - food (ignored)",
         is_prepaid=True,
-        category_prior=("Groceries", "Dining Out", "Coffee", "Beer / Wine"),
+        category_prior=(),
     ),
     "4881": CardInfo(
         last4="4881",

@@ -89,8 +89,7 @@ def lookup(merchant_normalized: str) -> Optional[MerchantMatch]:
     # 2. Fuzzy fallback — only meaningful if we already have some entries
     if not cache:
         return None
-    candidates = list(cache.keys())
-    result = fuzz_process.extractOne(key, candidates)
+    result = fuzz_process.extractOne(key, cache.keys())
     if not result:
         return None
     matched_key, score = result
@@ -137,6 +136,11 @@ def learn(merchant_normalized: str, category: str, source: str = "user") -> None
         "last_seen": "",
         "hits": existing.get("hits", 0) + 1,
     }
+
+
+def preload() -> int:
+    """Eagerly load the merchant map from Sheets. Returns entry count."""
+    return len(_ensure_loaded())
 
 
 def reset_cache_for_tests() -> None:

@@ -1,7 +1,7 @@
 """
 scripts/test_isracard_parser.py — smoke test for parsing/isracard_parser.py.
 
-Runs the 12 real SMS bodies you forwarded through the parser and prints a
+Runs real Isracard SMS bodies through the parser and prints a
 table of extracted fields. No assertions; the goal is a quick eye check that
 every field comes out clean before any of the rest of the pipeline is wired.
 
@@ -84,6 +84,12 @@ SAMPLES: list[tuple[str, str]] = [
 בכרטיסך 4881 אושרה עסקה ב-17/04 בסך 55.10 ש"ח בGETT.
 למידע נוסף באפליקציה ובאתר: https://isracard.onelink.me/bajD/6x5cat4g.
 לשירותך,  ישראכרט"""),
+
+    # Format B without merchant name
+    ("B.6547.no_merchant", """שלום,
+בכרטיסך 6547 אושרה עסקה ב-20/05 בסך 27.92 ש"ח.
+למידע נוסף באפליקציה ובאתר: https://isracard.onelink.me/bajD/cvkxkhfb.
+לשירותך,  ישראכרט"""),
 ]
 
 
@@ -93,7 +99,8 @@ def main() -> int:
     failures: list[str] = []
     for label, body in SAMPLES:
         t = parse(body, now=NOW)
-        ok = t.is_loggable
+        ok = t.is_actionable
+        loggable = t.is_loggable
         flag = "OK " if ok else "MISS"
         date_s = t.txn_date.isoformat() if t.txn_date else "—"
         time_s = t.txn_time or "—"
@@ -106,6 +113,7 @@ def main() -> int:
               f"date={date_s}  time={time_s}")
         print(f"  merchant_raw       = {merchant_s!r}")
         print(f"  merchant_normalized= {norm_s!r}")
+        print(f"  is_loggable={loggable}")
         print()
 
         if not ok:

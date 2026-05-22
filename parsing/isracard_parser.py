@@ -54,14 +54,18 @@ class Transaction:
     raw_body: str = ""
 
     @property
-    def is_loggable(self) -> bool:
-        """True only if we have the bare minimum needed to write a row."""
+    def is_actionable(self) -> bool:
+        """True if we have enough to prompt the user or log (merchant optional)."""
         return (
             self.kind in ("charge", "refund")
             and self.amount is not None
             and self.amount > 0
-            and self.merchant_normalized
         )
+
+    @property
+    def is_loggable(self) -> bool:
+        """True if we can auto-log without asking (requires merchant for mapping)."""
+        return self.is_actionable and bool(self.merchant_normalized)
 
 
 # ---------------------------------------------------------------------------

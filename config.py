@@ -61,3 +61,10 @@ except (TypeError, ValueError):
 
 # HTTP port for the Flask server (Render injects PORT). Used by server.py.
 HTTP_PORT = int(os.getenv("PORT", "10000"))
+
+# Card last4 values to skip entirely (no Telegram, no sheet). Default: food prepaid.
+IGNORED_CARDS = frozenset(
+    s.strip()
+    for s in os.getenv("IGNORED_CARDS", "4888,0347").split(",")
+    if s.strip()
+)

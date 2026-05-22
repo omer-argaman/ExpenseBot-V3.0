@@ -118,8 +118,23 @@ def _stub_fx_convert(amount, currency_from, currency_to="ILS"):
     return None
 
 
+def _stub_read_pending_asks():
+    return []
+
+
+def _stub_upsert_pending_ask(row):
+    pass
+
+
+def _stub_delete_pending_ask(pending_id):
+    pass
+
+
 # Apply stubs
 sheets_mod.log_expense = _stub_log_expense  # type: ignore[assignment]
+sheets_mod.read_pending_asks = _stub_read_pending_asks  # type: ignore[assignment]
+sheets_mod.upsert_pending_ask = _stub_upsert_pending_ask  # type: ignore[assignment]
+sheets_mod.delete_pending_ask = _stub_delete_pending_ask  # type: ignore[assignment]
 notifier_mod.send_message = _stub_send_message  # type: ignore[assignment]
 commands_mod.append_to_history = _stub_append_to_history  # type: ignore[assignment]
 merchant_map_mod.learn = _stub_learn  # type: ignore[assignment]
@@ -170,9 +185,9 @@ def _post(payload, secret="test-secret"):
 
 
 SAMPLES = [
-    ("A.0347.billabong",   "msg-1",  "Other (Daily)", "logged"),
-    ("A.4888.golda",        "msg-2",  None, "asked"),
-    ("A.0347.terminalx",    "msg-3",  "Other (Daily)", "logged"),
+    ("A.0347.billabong",   "msg-1",  None, "ignored"),
+    ("A.4888.golda",        "msg-2",  None, "ignored"),
+    ("A.0347.terminalx",    "msg-3",  None, "ignored"),
     ("B.4881.atalef",       "msg-4",  None, "asked"),
     ("B.4881.iriya",        "msg-5",  "Property Tax", "logged"),
     ("B.4881.claude_usd",   "msg-6",  None, "asked"),
@@ -230,7 +245,7 @@ print(f"  disallowed issuer    http={code}  status={data['status']}")
 # 6. URL-param style (iOS Shortcut shape) — secret + body in the URL, no auth header.
 from urllib.parse import quote_plus  # noqa: E402
 
-ios_body = bodies["A.0347.terminalx"]
+ios_body = bodies["B.4881.gett"]
 ios_url = (
     f"http://127.0.0.1:{PORT}/ingest"
     f"?secret=test-secret"
@@ -245,7 +260,7 @@ except urlerr.HTTPError as e:
     ios_code, ios_data = e.code, json.loads(e.read())
 print(f"  iOS URL-param style  http={ios_code}  status={ios_data['status']}  cat={ios_data.get('category') or '—'}")
 assert ios_data["status"] == "duplicate", \
-    f"expected duplicate (terminalx already logged above) but got {ios_data['status']}"
+    f"expected duplicate (gett already logged above) but got {ios_data['status']}"
 
 # 7. URL-param with WRONG ?secret= must reject
 bad_secret_url = (
@@ -273,8 +288,17 @@ try:
 except urlerr.HTTPError as e:
     fresh_code, fresh_data = e.code, json.loads(e.read())
 print(f"  iOS URL fresh txn    http={fresh_code}  status={fresh_data['status']}  cat={fresh_data.get('category') or '—'}")
-assert fresh_data["status"] in ("logged", "asked"), \
-    f"expected logged or asked, got {fresh_data['status']}"
+assert fresh_data["status"] == "ignored", \
+    f"expected ignored (card 4888), got {fresh_data['status']}"
+
+# 9. No-merchant SMS — should ask for category
+NO_MERCHANT_BODY = """שלום,
+בכרטיסך 6547 אושרה עסקה ב-20/05 בסך 27.92 ש"ח.
+למידע נוסף באפליקציה ובאתר: https://isracard.onelink.me/bajD/cvkxkhfb.
+לשירותך,  ישראכרט"""
+code, data = _post({"issuer": "isracard", "body": NO_MERCHANT_BODY, "message_id": "msg-no-merchant"})
+print(f"  no-merchant SMS      http={code}  status={data['status']}")
+assert data["status"] == "asked", f"expected asked, got {data['status']}"
 
 # --- Summary ---
 print("\nSummary:")

@@ -641,3 +641,212 @@ def upsert_merchant_mapping(
         f"Merchant map: updated {merchant_normalized!r} -> {new_category!r} "
         f"(source={new_source}, hits={new_hits})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Pending tab — sheet-backed Telegram category asks (survive Render restarts)
+#
+#   pending_id | merchant_normalized | merchant_raw | amount_ils |
+#   txn_date_iso | sheet_note | candidates_json | created_at
+# ---------------------------------------------------------------------------
+
+PENDING_TAB_NAME = "Pending"
+_PENDING_HEADERS = [
+    "pending_id",
+    "merchant_normalized",
+    "merchant_raw",
+    "amount_ils",
+    "txn_date_iso",
+    "sheet_note",
+    "candidates_json",
+    "created_at",
+]
+
+
+def _ensure_pending_tab(service) -> int:
+    cached = getattr(_ensure_pending_tab, "_cached_sheet_id", None)
+    if cached is not None:
+        return cached
+
+    metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    for s in metadata.get("sheets", []):
+        if s["properties"]["title"] == PENDING_TAB_NAME:
+            sheet_id = s["properties"]["sheetId"]
+            _ensure_pending_tab._cached_sheet_id = sheet_id  # type: ignore[attr-defined]
+            return sheet_id
+
+    add_resp = service.spreadsheets().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body={
+            "requests": [
+                {
+                    "addSheet": {
+                        "properties": {
+                            "title": PENDING_TAB_NAME,
+                            "hidden": True,
+                            "gridProperties": {"rowCount": 500, "columnCount": 8},
+                        }
+                    }
+                }
+            ]
+        },
+    ).execute()
+    sheet_id = add_resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{PENDING_TAB_NAME}'!A1:H1",
+        valueInputOption="RAW",
+        body={"values": [_PENDING_HEADERS]},
+    ).execute()
+    logger.info(f"Created hidden tab '{PENDING_TAB_NAME}' for pending asks")
+
+    _ensure_pending_tab._cached_sheet_id = sheet_id  # type: ignore[attr-defined]
+    return sheet_id
+
+
+def read_pending_asks() -> list[dict]:
+    """Return all pending-ask rows. [] if tab missing."""
+    service = _build_service()
+    metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    has_tab = any(
+        s["properties"]["title"] == PENDING_TAB_NAME
+        for s in metadata.get("sheets", [])
+    )
+    if not has_tab:
+        return []
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{PENDING_TAB_NAME}'!A2:H",
+    ).execute()
+    rows = result.get("values", [])
+
+    out: list[dict] = []
+    for r in rows:
+        r = (r + [""] * len(_PENDING_HEADERS))[: len(_PENDING_HEADERS)]
+        (
+            pending_id,
+            merchant_normalized,
+            merchant_raw,
+            amount_ils,
+            txn_date_iso,
+            sheet_note,
+            candidates_json,
+            created_at,
+        ) = r
+        if not pending_id:
+            continue
+        try:
+            amount = float(amount_ils) if amount_ils else 0.0
+        except ValueError:
+            amount = 0.0
+        try:
+            created = float(created_at) if created_at else 0.0
+        except ValueError:
+            created = 0.0
+        out.append({
+            "pending_id": pending_id.strip(),
+            "merchant_normalized": merchant_normalized.strip(),
+            "merchant_raw": merchant_raw.strip(),
+            "amount_ils": amount,
+            "txn_date_iso": txn_date_iso.strip(),
+            "sheet_note": sheet_note.strip(),
+            "candidates_json": candidates_json.strip(),
+            "created_at": created,
+        })
+    return out
+
+
+def upsert_pending_ask(row: dict) -> None:
+    """Insert or update one pending ask row."""
+    pending_id = (row.get("pending_id") or "").strip()
+    if not pending_id:
+        return
+
+    service = _build_service()
+    _ensure_pending_tab(service)
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{PENDING_TAB_NAME}'!A2:H",
+    ).execute()
+    rows = result.get("values", [])
+
+    sheet_row = [
+        pending_id,
+        row.get("merchant_normalized", ""),
+        row.get("merchant_raw", ""),
+        str(row.get("amount_ils", 0)),
+        row.get("txn_date_iso", ""),
+        row.get("sheet_note", ""),
+        row.get("candidates_json", "[]"),
+        str(row.get("created_at", 0)),
+    ]
+
+    existing_row_index: Optional[int] = None
+    for i, r in enumerate(rows):
+        r_padded = (r + [""] * len(_PENDING_HEADERS))[: len(_PENDING_HEADERS)]
+        if r_padded[0].strip() == pending_id:
+            existing_row_index = i + 2
+            break
+
+    if existing_row_index is None:
+        service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{PENDING_TAB_NAME}'!A:H",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [sheet_row]},
+        ).execute()
+    else:
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{PENDING_TAB_NAME}'!A{existing_row_index}:H{existing_row_index}",
+            valueInputOption="RAW",
+            body={"values": [sheet_row]},
+        ).execute()
+
+
+def delete_pending_ask(pending_id: str) -> None:
+    """Remove a pending ask row by pending_id."""
+    if not pending_id:
+        return
+
+    service = _build_service()
+    metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    sheet_id = None
+    for s in metadata.get("sheets", []):
+        if s["properties"]["title"] == PENDING_TAB_NAME:
+            sheet_id = s["properties"]["sheetId"]
+            break
+    if sheet_id is None:
+        return
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{PENDING_TAB_NAME}'!A2:A",
+    ).execute()
+    rows = result.get("values", [])
+
+    for i, r in enumerate(rows):
+        if r and r[0].strip() == pending_id:
+            row_index = i + 1  # 0-based within data rows; sheet row = i+2
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={
+                    "requests": [
+                        {
+                            "deleteDimension": {
+                                "range": {
+                                    "sheetId": sheet_id,
+                                    "dimension": "ROWS",
+                                    "startIndex": row_index,
+                                    "endIndex": row_index + 1,
+                                }
+                            }
+                        }
+                    ]
+                },
+            ).execute()
+            return

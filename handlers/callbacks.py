@@ -37,7 +37,13 @@ from handlers.commands import (
     BROAD_CATEGORIES,
 )
 from handlers.ai_handler import explain_sheet_missing
-from handlers.transaction_handler import pop_pending, store_pending
+from handlers.transaction_handler import peek_pending, pop_pending
+
+_EXPIRED_MSG = (
+    "This category prompt expired (bot restarted or it's older than 24h). "
+    "If you still need to log it, check the amount on the message above "
+    "or wait for the next SMS."
+)
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +209,7 @@ async def _handle_txn_callback(query, data: str) -> None:
     if data.startswith("txn_pick:"):
         pending_id, category = _decode_pick(data)
         if not pending_id or not category:
-            await query.edit_message_text("This action has expired.")
+            await query.edit_message_text(_EXPIRED_MSG)
             return
         await _commit_txn(query, pending_id, category)
         return
@@ -217,9 +223,9 @@ async def _handle_txn_callback(query, data: str) -> None:
     action = parts[2]
 
     if action == "more":
-        # Re-store the pending unchanged (pop_pending would consume it).
-        # Easiest: peek without popping by using store_pending defensively.
-        # We didn't expose a peek API, so just rebuild keyboard from CATEGORY_MAP.
+        if peek_pending(pending_id) is None:
+            await query.edit_message_text(_EXPIRED_MSG)
+            return
         keyboard = _expanded_category_keyboard(pending_id)
         await query.edit_message_reply_markup(reply_markup=keyboard)
         return
@@ -230,18 +236,14 @@ async def _handle_txn_callback(query, data: str) -> None:
         except ValueError:
             await query.edit_message_text("Invalid choice.")
             return
-        # We need the candidate list. Peek by popping then re-storing.
-        ask = pop_pending(pending_id)
+        ask = peek_pending(pending_id)
         if ask is None:
-            await query.edit_message_text("This action has expired.")
+            await query.edit_message_text(_EXPIRED_MSG)
             return
         if index < 0 or index >= len(ask.candidates):
-            store_pending(ask)  # restore so user can retry
             await query.edit_message_text("Invalid choice.")
             return
         category = ask.candidates[index]
-        # Re-store under the same id so _commit_txn can pop it cleanly
-        store_pending(ask)
         await _commit_txn(query, pending_id, category)
         return
 
@@ -249,9 +251,9 @@ async def _handle_txn_callback(query, data: str) -> None:
 
 
 async def _commit_txn(query, pending_id: str, category: str) -> None:
-    ask = pop_pending(pending_id)
+    ask = peek_pending(pending_id)
     if ask is None:
-        await query.edit_message_text("This action has expired.")
+        await query.edit_message_text(_EXPIRED_MSG)
         return
 
     if category not in CATEGORY_MAP:
@@ -278,6 +280,8 @@ async def _commit_txn(query, pending_id: str, category: str) -> None:
             )
         return
 
+    pop_pending(pending_id)
+
     append_to_history(
         category=log_result.category,
         amount=log_result.amount_added,
@@ -287,14 +291,19 @@ async def _commit_txn(query, pending_id: str, category: str) -> None:
         original_text=ask.sheet_note,
     )
 
-    # Persist the user's choice so we never ask again for this merchant.
     if ask.merchant_normalized:
         learn_merchant(ask.merchant_normalized, category, source="user")
+
+    saved_line = ""
+    if ask.merchant_normalized:
+        saved_line = (
+            f"<i>Saved {ask.merchant_normalized!r} = {category}. "
+            f"Won't ask again for this merchant.</i>"
+        )
 
     await query.edit_message_text(
         f"<b>Logged: {abs(log_result.amount_added):g} ILS → {category}</b>\n"
         f"{ask.merchant_raw}\n"
-        f"<i>Saved {ask.merchant_normalized!r} = {category}. "
-        f"Won't ask again for this merchant.</i>",
+        f"{saved_line}",
         parse_mode="HTML",
     )

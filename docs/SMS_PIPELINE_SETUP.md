@@ -29,22 +29,14 @@ Add the following to your existing Render service's Environment tab:
 | `CARD_PRIORS`              | optional | see below | JSON map of last4 -> card metadata. Defaults are in `parsing/card_registry.py`. |
 | `HIGH_CONFIDENCE_THRESHOLD`| optional | `0.85`            | Below this the bot asks via Telegram instead of auto-logging. Use `0.99` for "always confirm" mode while training. |
 | `ALLOWED_ISSUERS`          | optional | `isracard`        | Comma-separated. Reject any other issuer at the door. |
+| `IGNORED_CARDS`            | optional | `4888,0347`       | Comma-separated last4 values to skip silently (no Telegram, no sheet). |
 
-The default `CARD_PRIORS` already has 0347 (clothing prepaid), 4888 (food
-prepaid), and 4881 (general credit). Override only if your priors change:
+Prepaid cards **4888** (food) and **0347** (clothing/appliances) are ignored
+by default. The default `CARD_PRIORS` only needs **4881** (general credit).
+Override `CARD_PRIORS` only if your priors change:
 
 ```json
 {
-  "0347": {
-    "name": "Isracard prepaid - clothing/appliances",
-    "is_prepaid": true,
-    "category_prior": ["Other (Daily)", "Maintenance/Improvements"]
-  },
-  "4888": {
-    "name": "Isracard prepaid - food",
-    "is_prepaid": true,
-    "category_prior": ["Groceries", "Dining Out", "Coffee", "Beer / Wine"]
-  },
   "4881": {
     "name": "Isracard credit - general",
     "is_prepaid": false,
@@ -54,6 +46,16 @@ prepaid), and 4881 (general credit). Override only if your priors change:
 ```
 
 `PORT` is already set by Render automatically; you don't need to touch it.
+
+### Memory and persistence (Render)
+
+- **Merchant → category** mappings live in a hidden Google Sheet tab **Merchants**
+  (created on first save). They survive bot restarts; check this tab if a merchant
+  keeps being re-asked after a crash.
+- **Pending category asks** are stored in a hidden **Pending** tab so inline
+  buttons still work after a Render restart (until 24h expiry).
+- Startup logs `Merchant map preloaded (N entries)` and `Memory RSS: X MB` for
+  monitoring. If memory still hits 512 MB, consider a larger Render instance.
 
 ## 2. Get your Telegram chat id
 
