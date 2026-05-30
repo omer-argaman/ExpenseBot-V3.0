@@ -109,6 +109,12 @@ async def _cleanup_idle_users(context: ContextTypes.DEFAULT_TYPE) -> None:
     _rss_log_counter += 1
     if _rss_log_counter % 7 == 0:
         _log_memory_rss()
+    from _debug_trace import dbg  # noqa: PLC0415
+
+    dbg("H6", "bot._cleanup_idle_users", "tick", {
+        "user_data_count": len(context.application.user_data),
+        "cleaned": cleaned,
+    })
 
 
 async def _post_init(application: Application) -> None:
@@ -118,12 +124,20 @@ async def _post_init(application: Application) -> None:
         logger.info("Startup: merchant map preloaded (%d entries)", n_merchants)
     except Exception as exc:
         logger.warning("Startup: merchant map preload failed: %s", exc)
+        n_merchants = -1
     try:
         n_pending = preload_pending_asks()
         logger.info("Startup: pending asks preloaded (%d entries)", n_pending)
     except Exception as exc:
         logger.warning("Startup: pending asks preload failed: %s", exc)
+        n_pending = -1
     _log_memory_rss()
+    from _debug_trace import dbg  # noqa: PLC0415
+
+    dbg("ALL", "bot._post_init", "startup_complete", {
+        "n_merchants": n_merchants,
+        "n_pending": n_pending,
+    })
 
     application.job_queue.run_monthly(
         send_monthly_report,
@@ -139,6 +153,23 @@ async def _post_init(application: Application) -> None:
     )
     logger.info("Idle-user cleanup job registered: runs daily, "
                 f"drops history for users idle > {IDLE_THRESHOLD_DAYS} days")
+
+    application.job_queue.run_repeating(
+        _memtrace_tick,
+        interval=timedelta(minutes=10),
+        first=timedelta(minutes=1),
+    )
+    logger.info("Memtrace snapshot job registered: every 10 min")
+
+
+async def _memtrace_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Periodic heap census so we can see idle-period memory creep."""
+    from _debug_trace import dbg, gc_census  # noqa: PLC0415
+
+    dbg("IDLE", "bot._memtrace_tick", "snapshot", {
+        "user_data_count": len(context.application.user_data),
+        **gc_census(),
+    })
 
 
 def create_app() -> Application:

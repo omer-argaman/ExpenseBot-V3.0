@@ -207,7 +207,17 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # AI path — parser is uncertain or has no match
     # ------------------------------------------------------------------
     history = _get_ai_history(context)
+    from _debug_trace import dbg, gc_census  # noqa: PLC0415
+
+    dbg("H6", "message.tg_handle_message", "before_ask_ai", {
+        "history_len": len(history),
+        "text_len": len(text),
+    })
     ai_result = await ask_ai(text, history)
+    dbg("H6", "message.tg_handle_message", "after_ask_ai", {
+        "action": ai_result.get("action"),
+        **gc_census(),
+    })
 
     action = ai_result["action"]
 

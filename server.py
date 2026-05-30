@@ -90,7 +90,17 @@ def create_app() -> Flask:
         payload["issuer"] = issuer
 
         try:
+            from _debug_trace import dbg, gc_census  # noqa: PLC0415
+
+            dbg("H5", "server.ingest", "before_process", {
+                "body_len": len(str(payload.get("body") or "")),
+                "issuer": payload.get("issuer"),
+            })
             result = process_ingest(payload)
+            dbg("H5", "server.ingest", "after_process", {
+                "status": result.status,
+                **gc_census(),
+            })
         except Exception as exc:
             logger.exception("process_ingest crashed: %s", exc)
             return jsonify(status="error", detail=f"server error: {exc}"), 500

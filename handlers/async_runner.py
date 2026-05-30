@@ -36,6 +36,12 @@ def _ensure_loop() -> asyncio.AbstractEventLoop:
 
 def run_coro(coro, timeout: float = 90.0) -> T:
     """Run an async coroutine on the shared loop and block for the result."""
+    from _debug_trace import dbg  # noqa: PLC0415
+
     loop = _ensure_loop()
+    dbg("H1", "async_runner.run_coro", "before", {"pending_tasks": len(asyncio.all_tasks(loop))})
     future = asyncio.run_coroutine_threadsafe(coro, loop)
-    return future.result(timeout=timeout)
+    try:
+        return future.result(timeout=timeout)
+    finally:
+        dbg("H1", "async_runner.run_coro", "after", {"pending_tasks": len(asyncio.all_tasks(loop))})
