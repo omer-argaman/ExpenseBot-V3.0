@@ -4,6 +4,7 @@ sheets.py — Google Sheets integration.
 Responsibilities:
   - Connect to the Sheets API using service account credentials.
   - Find the correct month tab from a wide range of supported name formats.
+  - Duplicate Format when an expense targets a missing month.
   - Find the row for a given category in column A.
   - Read the current amount from column C.
   - Write the new cumulative amount to column C.
@@ -19,10 +20,12 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
+from threading import Lock
 from typing import Optional
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from config import SPREADSHEET_ID, GOOGLE_CREDENTIALS_JSON
 
@@ -113,6 +116,7 @@ class LogResult:
 # ---------------------------------------------------------------------------
 
 _service_cache = None
+_month_tab_lock = Lock()
 _tabs_cache: tuple[float, dict[str, tuple[str, int]]] | None = None
 _TABS_CACHE_TTL_SECONDS = 300
 _MAX_NOTE_CHARS = 12_000  # cap cell notes to limit read/write memory per log
@@ -237,6 +241,48 @@ def find_tab_for_month(service, dt: datetime) -> Optional[tuple[str, int]]:
     if not result:
         logger.warning(f"No tab found for {dt.strftime('%B %Y')}. Tried: {_candidate_tab_names(dt)}")
     return result
+
+
+def _ensure_month_tab(service, dt: datetime) -> Optional[tuple[str, int]]:
+    """Create a missing transaction month from Format, serializing local callers."""
+    with _month_tab_lock:
+        tabs = get_spreadsheet_tabs(service)
+        tab_info = find_tab_in_tabs(tabs, dt)
+        if tab_info is not None:
+            return tab_info
+
+        # Recheck live metadata: another caller or a manual edit may have added it.
+        invalidate_spreadsheet_tabs_cache()
+        tabs = get_spreadsheet_tabs(service)
+        tab_info = find_tab_in_tabs(tabs, dt)
+        if tab_info is not None:
+            return tab_info
+        template = tabs.get("format")
+        if template is None:
+            logger.error("Cannot create month tab: template 'Format' is missing.")
+            return None
+
+        spreadsheets, _ = _sheet_resources(service)
+        try:
+            spreadsheets.batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={"requests": [{"duplicateSheet": {
+                    "sourceSheetId": template[1],
+                    "newSheetName": dt.strftime("%m%y"),
+                }}]},
+            ).execute()
+        except HttpError:
+            # Recover if a different process created the month at the same time.
+            invalidate_spreadsheet_tabs_cache()
+            tab_info = find_tab_in_tabs(get_spreadsheet_tabs(service), dt)
+            if tab_info is None:
+                raise
+            return tab_info
+
+        invalidate_spreadsheet_tabs_cache()
+        tab_info = find_tab_in_tabs(get_spreadsheet_tabs(service), dt)
+        logger.info("Created month tab '%s' from Format", dt.strftime("%m%y"))
+        return tab_info
 
 
 def describe_tab_failure(
@@ -418,11 +464,13 @@ def log_expense(
     dbg("H2", "sheets.log_expense", "enter", {"category": category, "amount": amount})
     service = _build_service()
 
-    # 1. Find the right month tab — fetch tabs once so we can build a rich
-    #    failure object without a second metadata call.
+    # 1. Resolve the transaction month, creating it from Format if needed.
     existing_tabs = get_spreadsheet_tabs(service)
     tab_info = find_tab_in_tabs(existing_tabs, dt)
     if tab_info is None:
+        tab_info = _ensure_month_tab(service, dt)
+    if tab_info is None:
+        existing_tabs = get_spreadsheet_tabs(service)
         logger.warning(
             f"No tab found for {dt.strftime('%B %Y')}. "
             f"Tried: {_candidate_tab_names(dt)}"
@@ -435,7 +483,8 @@ def log_expense(
             tab_name="",
             row=0,
             timestamp="",
-            message=f"No sheet tab found for {dt.strftime('%B %Y')}.",
+            message=(f"No sheet tab found for {dt.strftime('%B %Y')}; "
+                     "template 'Format' is missing."),
             failure=describe_tab_failure(existing_tabs, dt),
         )
     tab_name, sheet_id = tab_info
@@ -840,8 +889,8 @@ def upsert_pending_ask(row: dict) -> None:
 
 
 @lru_cache(maxsize=1)
-def _pending_delete_resources(service):
-    """Reuse discovery resources instead of rebuilding them for every expired row."""
+def _sheet_resources(service):
+    """Reuse discovery resources for Pending cleanup and month creation."""
     spreadsheets = service.spreadsheets()
     return spreadsheets, spreadsheets.values()
 
@@ -858,7 +907,7 @@ def delete_pending_ask(pending_id: str) -> None:
         return
     _, sheet_id = tab_info
 
-    spreadsheets, values = _pending_delete_resources(service)
+    spreadsheets, values = _sheet_resources(service)
     result = values.get(
         spreadsheetId=SPREADSHEET_ID,
         range=f"'{PENDING_TAB_NAME}'!A2:A",
