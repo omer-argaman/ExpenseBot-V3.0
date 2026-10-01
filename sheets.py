@@ -18,6 +18,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from typing import Optional
 
 from google.oauth2 import service_account
@@ -838,6 +839,13 @@ def upsert_pending_ask(row: dict) -> None:
         ).execute()
 
 
+@lru_cache(maxsize=1)
+def _pending_delete_resources(service):
+    """Reuse discovery resources instead of rebuilding them for every expired row."""
+    spreadsheets = service.spreadsheets()
+    return spreadsheets, spreadsheets.values()
+
+
 def delete_pending_ask(pending_id: str) -> None:
     """Remove a pending ask row by pending_id."""
     if not pending_id:
@@ -850,7 +858,8 @@ def delete_pending_ask(pending_id: str) -> None:
         return
     _, sheet_id = tab_info
 
-    result = service.spreadsheets().values().get(
+    spreadsheets, values = _pending_delete_resources(service)
+    result = values.get(
         spreadsheetId=SPREADSHEET_ID,
         range=f"'{PENDING_TAB_NAME}'!A2:A",
     ).execute()
@@ -859,7 +868,7 @@ def delete_pending_ask(pending_id: str) -> None:
     for i, r in enumerate(rows):
         if r and r[0].strip() == pending_id:
             row_index = i + 1  # 0-based within data rows; sheet row = i+2
-            service.spreadsheets().batchUpdate(
+            spreadsheets.batchUpdate(
                 spreadsheetId=SPREADSHEET_ID,
                 body={
                     "requests": [
