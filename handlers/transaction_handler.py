@@ -45,9 +45,13 @@ from parsing.merchant_map import (
     lookup as lookup_merchant,
 )
 from sheets import (
+    append_ledger_row,
     delete_pending_ask,
+    ledger_now,
     log_expense,
+    read_ledger_rows,
     read_pending_asks,
+    update_ledger_where,
     upsert_pending_ask,
 )
 
@@ -180,12 +184,13 @@ def _ask_from_row(row: dict) -> PendingAsk:
 def store_pending(ask: PendingAsk) -> None:
     with _pending_lock:
         _pending[ask.pending_id] = ask
+        # Evict old asks from memory only. The Pending sheet row stays until
+        # the ask is answered (Telegram tap or the expense MCP), so an
+        # unanswered ask is never lost; a late tap reloads it from the sheet.
         cutoff = time.time() - _PENDING_TTL_SECONDS
         for pid in list(_pending.keys()):
             if _pending[pid].created_at < cutoff:
-                expired = _pending.pop(pid, None)
-                if expired:
-                    _delete_pending_from_sheet(pid)
+                _pending.pop(pid, None)
     _sync_pending_to_sheet(ask)
 
 
@@ -222,8 +227,50 @@ def pop_pending(pending_id: str) -> Optional[PendingAsk]:
     return ask
 
 
+def pending_still_open(pending_id: str) -> bool:
+    """
+    True unless the ask was already settled elsewhere (e.g. by the expense MCP).
+
+    The Pending sheet row is the source of truth. If it is gone, the ledger
+    decides: only a ledger row that moved past "asked" means "already handled".
+    Any read failure keeps the old behavior (allow the tap).
+    """
+    try:
+        if any(r.get("pending_id") == pending_id for r in read_pending_asks()):
+            return True
+        statuses = [
+            r.get("status", "") for r in read_ledger_rows()
+            if r.get("pending_id") == pending_id
+        ]
+    except Exception as exc:
+        logger.warning("Could not verify pending ask %s: %s", pending_id, exc)
+        return True
+    if statuses and all(st != "asked" for st in statuses):
+        with _pending_lock:
+            _pending.pop(pending_id, None)
+        return False
+    return True
+
+
+def mark_ask_settled(pending_id: str, category: str, tab_name: str, note_line: str) -> None:
+    """Record a Telegram-answered ask in the ledger. Best effort."""
+    try:
+        update_ledger_where(
+            {"pending_id": pending_id},
+            {
+                "status": "settled",
+                "category": category,
+                "category_origin": "telegram_user",
+                "sheet_tab": tab_name,
+                "note_line": note_line,
+            },
+        )
+    except Exception as exc:
+        logger.warning("Could not update ledger for %s: %s", pending_id, exc)
+
+
 def preload_pending_asks() -> int:
-    """Load non-expired pending asks from Sheets into memory."""
+    """Load recent pending asks from Sheets into memory (older rows stay in the sheet)."""
     cutoff = time.time() - _PENDING_TTL_SECONDS
     try:
         rows = read_pending_asks()
@@ -234,7 +281,6 @@ def preload_pending_asks() -> int:
     with _pending_lock:
         for row in rows:
             if row.get("created_at", 0) < cutoff:
-                _delete_pending_from_sheet(row["pending_id"])
                 continue
             ask = _ask_from_row(row)
             _pending[ask.pending_id] = ask
@@ -253,6 +299,12 @@ class IngestResult:
     category: Optional[str] = None
     amount_ils: Optional[float] = None
     merchant: Optional[str] = None
+    # Ledger details (Transactions tab)
+    category_origin: str = ""
+    tab_name: str = ""
+    note_line: str = ""
+    pending_id: str = ""
+    note_text: str = ""
 
 
 def process_ingest(payload: dict[str, Any]) -> IngestResult:
@@ -318,6 +370,62 @@ def process_ingest(payload: dict[str, Any]) -> IngestResult:
             status="ignored",
             detail="unknown_transaction_kind",
         )
+
+    result = _process_transaction(txn, body, message_id)
+    _record_ledger(txn, body, result)
+    return result
+
+
+# IngestResult.status -> ledger status
+_LEDGER_STATUS = {
+    "logged": "logged",
+    "asked": "asked",
+    "skipped": "ignored",     # declined
+    "duplicate": "duplicate",
+    "ignored": "ignored",
+    "error": "error",
+}
+
+
+def _record_ledger(txn: "isracard_parser.Transaction", body: str, result: IngestResult) -> None:
+    """Write one Transactions-tab row for this ingest. Never raises."""
+    try:
+        now = ledger_now()
+        status = _LEDGER_STATUS.get(result.status, result.status)
+        detail = result.detail or ""
+        if status == "error":
+            detail = f"{detail} | SMS: {body[:200]}".replace("\n", " ")
+        append_ledger_row({
+            "txn_id": uuid.uuid4().hex[:12],
+            "received_at": now,
+            "source": "sms",
+            "card_last4": txn.last4 or "",
+            "merchant_raw": txn.merchant_raw or "",
+            "merchant_normalized": txn.merchant_normalized or "",
+            "amount_ils": result.amount_ils,
+            "currency": txn.currency or "ILS",
+            "amount_native": txn.amount,
+            "txn_date": txn.txn_date.isoformat() if txn.txn_date else "",
+            "status": status,
+            "category": result.category if status == "logged" else "",
+            "category_origin": result.category_origin,
+            "pending_id": result.pending_id,
+            "sheet_tab": result.tab_name,
+            "note_line": result.note_line,
+            "detail": detail[:300],
+            "updated_at": now,
+            "note_text": result.note_text,
+        })
+    except Exception as exc:
+        logger.warning("Could not write Transactions ledger row: %s", exc)
+
+
+def _process_transaction(
+    txn: "isracard_parser.Transaction",
+    body: str,
+    message_id: str,
+) -> IngestResult:
+    """Decide what to do with one parsed transaction (log, ask, skip)."""
 
     if txn.kind == "declined":
         logger.info("Skipping declined transaction: %s", txn.merchant_raw)
@@ -416,6 +524,10 @@ def process_ingest(payload: dict[str, Any]) -> IngestResult:
             amount_native=amount_native,
             sign=sign,
             map_origin=f"map ({map_hit.method}, {map_hit.confidence:.0%})",
+            category_origin=(
+                "map_fuzzy" if map_hit.method == "fuzzy"
+                else ("map_user" if map_hit.source == "user" else "map_auto")
+            ),
         )
 
     # 2. AI categorization with card prior
@@ -451,6 +563,7 @@ def process_ingest(payload: dict[str, Any]) -> IngestResult:
             amount_native=amount_native,
             sign=sign,
             map_origin=f"ai-auto ({confidence:.0%})",
+            category_origin="ai_auto",
         )
         learn_merchant(merchant_norm, category, source="auto")
         return result
@@ -509,6 +622,7 @@ def _do_log(
     amount_native: float,
     sign: int,
     map_origin: str,
+    category_origin: str = "",
 ) -> IngestResult:
     log_dt = (
         datetime(txn.txn_date.year, txn.txn_date.month, txn.txn_date.day)
@@ -533,6 +647,7 @@ def _do_log(
             category=category,
             amount_ils=amount_ils_signed,
             merchant=merchant_raw,
+            note_text=sheet_note,
         )
 
     append_to_history(
@@ -563,6 +678,10 @@ def _do_log(
         category=category,
         amount_ils=amount_ils_signed,
         merchant=merchant_raw,
+        category_origin=category_origin,
+        tab_name=log_result.tab_name,
+        note_line=log_result.note_line,
+        note_text=sheet_note,
     )
 
 
@@ -661,6 +780,7 @@ def _ask_user(
             amount_native=amount_native,
             sign=sign,
             map_origin="fallback",
+            category_origin="fallback",
         )
 
     ask.message_id = msg_id
@@ -670,6 +790,8 @@ def _ask_user(
         category=category_guess,
         amount_ils=sign * amount_ils,
         merchant=txn.merchant_raw,
+        pending_id=pending_id,
+        note_text=sheet_note,
     )
 
 

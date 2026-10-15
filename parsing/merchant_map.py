@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -44,18 +45,29 @@ class MerchantMatch:
 
 _lock = threading.Lock()
 _cache: dict[str, dict] | None = None  # key: lowercased merchant_normalized
+_loaded_at = 0.0
+# Re-read the sheet this often so mappings added elsewhere (e.g. the expense
+# MCP) are picked up without a restart.
+_CACHE_TTL_SECONDS = 5 * 60
 
 
 def _ensure_loaded() -> dict[str, dict]:
-    global _cache
+    global _cache, _loaded_at
     with _lock:
-        if _cache is None:
+        stale = _cache is not None and time.monotonic() - _loaded_at > _CACHE_TTL_SECONDS
+        if _cache is None or stale:
             try:
                 rows = read_merchant_map()
             except Exception as exc:
+                if _cache is not None:
+                    # Keep serving the old map; retry after another TTL.
+                    logger.warning("Could not refresh Merchants tab; keeping cache. (%s)", exc)
+                    _loaded_at = time.monotonic()
+                    return _cache
                 logger.warning("Could not read Merchants tab; starting empty. (%s)", exc)
                 rows = []
             _cache = {row["merchant_normalized"].lower(): row for row in rows}
+            _loaded_at = time.monotonic()
             logger.info("Merchant map loaded: %d entr%s",
                         len(_cache), "y" if len(_cache) == 1 else "ies")
         return _cache

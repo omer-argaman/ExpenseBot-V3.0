@@ -27,7 +27,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from config import SPREADSHEET_ID, GOOGLE_CREDENTIALS_JSON
+from config import SPREADSHEET_ID, GOOGLE_CREDENTIALS_JSON, ISRAEL_TZ
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +109,7 @@ class LogResult:
     timestamp: str        # the timestamp written into the note (used by /delete)
     message: str          # human-readable summary
     failure: Optional[TabLookupFailure] = None  # set when the failure was a missing tab
+    note_line: str = ""   # the exact full note line written (used by the Transactions ledger)
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +535,7 @@ def log_expense(
         row=row,
         timestamp=timestamp,
         message=f"✅ Added ₪{amount:g} to '{category}'. New total: ₪{new_total:g}",
+        note_line=new_line,
     )
     dbg("H2", "sheets.log_expense", "exit", {"success": True, "tab": tab_name})
 
@@ -935,3 +937,167 @@ def delete_pending_ask(pending_id: str) -> None:
                 },
             ).execute()
             return
+
+
+# ---------------------------------------------------------------------------
+# Transactions tab — ledger of every card transaction the bot received.
+#
+# One row per ingested transaction, updated as it is settled. Lets the
+# expense MCP find anything that never made it into the sheet (unanswered
+# asks, failures, fallbacks). Columns:
+#
+#   txn_id | received_at | source | card_last4 | merchant_raw |
+#   merchant_normalized | amount_ils | currency | amount_native | txn_date |
+#   status | category | category_origin | pending_id | sheet_tab |
+#   note_line | detail | updated_at | note_text
+#
+# note_text is the text the entry has (or would have) after the timestamp,
+# kept so a failed or unanswered transaction can be logged later.
+#
+# Rows are never deleted. Every write here is best effort for callers.
+# ---------------------------------------------------------------------------
+
+TRANSACTIONS_TAB_NAME = "Transactions"
+LEDGER_HEADERS = [
+    "txn_id",
+    "received_at",
+    "source",
+    "card_last4",
+    "merchant_raw",
+    "merchant_normalized",
+    "amount_ils",
+    "currency",
+    "amount_native",
+    "txn_date",
+    "status",
+    "category",
+    "category_origin",
+    "pending_id",
+    "sheet_tab",
+    "note_line",
+    "detail",
+    "updated_at",
+    "note_text",
+]
+_LEDGER_LAST_COL = "S"
+
+
+def ledger_now() -> str:
+    """Current Israel time as an ISO string, used for received_at/updated_at."""
+    return datetime.now(ISRAEL_TZ).isoformat(timespec="seconds")
+
+
+def _ensure_transactions_tab(service) -> int:
+    cached = getattr(_ensure_transactions_tab, "_cached_sheet_id", None)
+    if cached is not None:
+        return cached
+
+    metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    for s in metadata.get("sheets", []):
+        if s["properties"]["title"] == TRANSACTIONS_TAB_NAME:
+            sheet_id = s["properties"]["sheetId"]
+            _ensure_transactions_tab._cached_sheet_id = sheet_id  # type: ignore[attr-defined]
+            return sheet_id
+
+    add_resp = service.spreadsheets().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body={
+            "requests": [
+                {
+                    "addSheet": {
+                        "properties": {
+                            "title": TRANSACTIONS_TAB_NAME,
+                            "hidden": True,
+                            "gridProperties": {
+                                "rowCount": 1000,
+                                "columnCount": len(LEDGER_HEADERS),
+                            },
+                        }
+                    }
+                }
+            ]
+        },
+    ).execute()
+    sheet_id = add_resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{TRANSACTIONS_TAB_NAME}'!A1:{_LEDGER_LAST_COL}1",
+        valueInputOption="RAW",
+        body={"values": [LEDGER_HEADERS]},
+    ).execute()
+    invalidate_spreadsheet_tabs_cache()
+    logger.info(f"Created hidden tab '{TRANSACTIONS_TAB_NAME}' for the transaction ledger")
+
+    _ensure_transactions_tab._cached_sheet_id = sheet_id  # type: ignore[attr-defined]
+    return sheet_id
+
+
+def _ledger_cell(value) -> object:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return round(value, 2)
+    return value
+
+
+def append_ledger_row(row: dict) -> None:
+    """Append one ledger row. Missing keys are written as empty cells."""
+    service = _build_service()
+    _ensure_transactions_tab(service)
+    service.spreadsheets().values().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{TRANSACTIONS_TAB_NAME}'!A:{_LEDGER_LAST_COL}",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [[_ledger_cell(row.get(h)) for h in LEDGER_HEADERS]]},
+    ).execute()
+
+
+def read_ledger_rows() -> list[dict]:
+    """Return all ledger rows as dicts (string values). [] if the tab is missing."""
+    service = _build_service()
+    tabs = get_spreadsheet_tabs(service)
+    if TRANSACTIONS_TAB_NAME.lower() not in tabs:
+        return []
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{TRANSACTIONS_TAB_NAME}'!A2:{_LEDGER_LAST_COL}",
+    ).execute()
+    out = []
+    for r in result.get("values", []):
+        r = (list(r) + [""] * len(LEDGER_HEADERS))[: len(LEDGER_HEADERS)]
+        out.append({h: (str(v) if v is not None else "") for h, v in zip(LEDGER_HEADERS, r)})
+    return out
+
+
+def update_ledger_where(match: dict, updates: dict) -> int:
+    """
+    Update every ledger row whose columns equal all values in `match`.
+    Returns the number of rows updated. `updated_at` is set automatically.
+    """
+    service = _build_service()
+    tabs = get_spreadsheet_tabs(service)
+    if TRANSACTIONS_TAB_NAME.lower() not in tabs:
+        return 0
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{TRANSACTIONS_TAB_NAME}'!A2:{_LEDGER_LAST_COL}",
+    ).execute()
+    updates = {**updates, "updated_at": ledger_now()}
+    count = 0
+    for i, r in enumerate(result.get("values", [])):
+        r = (list(r) + [""] * len(LEDGER_HEADERS))[: len(LEDGER_HEADERS)]
+        row = dict(zip(LEDGER_HEADERS, (str(v) for v in r)))
+        if not all(row.get(k, "") == str(v) for k, v in match.items()):
+            continue
+        row.update({k: _ledger_cell(v) for k, v in updates.items()})
+        sheet_row = i + 2
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{TRANSACTIONS_TAB_NAME}'!A{sheet_row}:{_LEDGER_LAST_COL}{sheet_row}",
+            valueInputOption="RAW",
+            body={"values": [[row[h] for h in LEDGER_HEADERS]]},
+        ).execute()
+        count += 1
+    return count

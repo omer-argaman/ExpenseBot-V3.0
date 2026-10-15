@@ -63,6 +63,7 @@ def _stub_log_expense(category, amount, original_text, dt=None):
         tab_name="0526", row=1,
         timestamp=time.strftime("%Y-%m-%d %H:%M"),
         message=f"Added {amount} to {category}",
+        note_line=f"{time.strftime('%Y-%m-%d %H:%M')}  {original_text}",
     )
 
 
@@ -127,7 +128,28 @@ def _stub_upsert_pending_ask(row):
 
 
 def _stub_delete_pending_ask(pending_id):
-    pass
+    DELETED_PENDING.append(pending_id)
+
+
+LEDGER: list[dict] = []
+DELETED_PENDING: list[str] = []
+
+
+def _stub_append_ledger_row(row):
+    LEDGER.append(dict(row))
+
+
+def _stub_read_ledger_rows():
+    return [dict(r) for r in LEDGER]
+
+
+def _stub_update_ledger_where(match, updates):
+    n = 0
+    for r in LEDGER:
+        if all(str(r.get(k, "")) == str(v) for k, v in match.items()):
+            r.update(updates)
+            n += 1
+    return n
 
 
 # Apply stubs
@@ -135,6 +157,9 @@ sheets_mod.log_expense = _stub_log_expense  # type: ignore[assignment]
 sheets_mod.read_pending_asks = _stub_read_pending_asks  # type: ignore[assignment]
 sheets_mod.upsert_pending_ask = _stub_upsert_pending_ask  # type: ignore[assignment]
 sheets_mod.delete_pending_ask = _stub_delete_pending_ask  # type: ignore[assignment]
+sheets_mod.append_ledger_row = _stub_append_ledger_row  # type: ignore[assignment]
+sheets_mod.read_ledger_rows = _stub_read_ledger_rows  # type: ignore[assignment]
+sheets_mod.update_ledger_where = _stub_update_ledger_where  # type: ignore[assignment]
 notifier_mod.send_message = _stub_send_message  # type: ignore[assignment]
 commands_mod.append_to_history = _stub_append_to_history  # type: ignore[assignment]
 merchant_map_mod.learn = _stub_learn  # type: ignore[assignment]

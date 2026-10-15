@@ -37,12 +37,17 @@ from handlers.commands import (
     BROAD_CATEGORIES,
 )
 from handlers.ai_handler import explain_sheet_missing
-from handlers.transaction_handler import peek_pending, pop_pending, reload_pending_from_sheet
+from handlers.transaction_handler import (
+    mark_ask_settled,
+    peek_pending,
+    pending_still_open,
+    pop_pending,
+    reload_pending_from_sheet,
+)
 
 _EXPIRED_MSG = (
-    "This category prompt expired (bot restarted or it's older than 24h). "
-    "If you still need to log it, check the amount on the message above "
-    "or wait for the next SMS."
+    "This one was already handled (in Claude or by another tap), "
+    "so nothing was logged twice."
 )
 
 logger = logging.getLogger(__name__)
@@ -271,6 +276,11 @@ async def _commit_txn(query, pending_id: str, category: str) -> None:
         await query.edit_message_text(f"Unknown category: {category}")
         return
 
+    # The expense MCP may have settled this ask already; never log twice.
+    if not pending_still_open(pending_id):
+        await query.edit_message_text(_EXPIRED_MSG)
+        return
+
     log_dt = (
         datetime(ask.txn_date.year, ask.txn_date.month, ask.txn_date.day)
         if ask.txn_date else None
@@ -292,6 +302,7 @@ async def _commit_txn(query, pending_id: str, category: str) -> None:
         return
 
     pop_pending(pending_id)
+    mark_ask_settled(pending_id, category, log_result.tab_name, log_result.note_line)
     dbg("H5", "callbacks._commit_txn", "logged_ok", {"pending_id": pending_id})
 
     append_to_history(

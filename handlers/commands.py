@@ -583,13 +583,21 @@ def delete(n: int = 1) -> str:
         new_total = current - amount
         _write_amount(service, tab_name, row, new_total)
 
-        # Remove matching note line
+        # Remove the matching note line. Prefer the exact full line so other
+        # entries logged in the same minute (e.g. by the expense MCP) survive.
         existing_note = _read_existing_note(service, tab_name, row)
-        updated_lines = [
-            line for line in existing_note.split("\n")
-            if not line.startswith(timestamp)
-        ]
+        note_lines = existing_note.split("\n")
+        exact_line = f"{timestamp}  {entry['original_text']}"
+        if exact_line in note_lines:
+            idx = len(note_lines) - 1 - note_lines[::-1].index(exact_line)
+            updated_lines = note_lines[:idx] + note_lines[idx + 1:]
+        else:
+            updated_lines = [
+                line for line in note_lines
+                if not line.startswith(timestamp)
+            ]
         _write_note(service, tab_name, row, sheet_id, "\n".join(updated_lines).strip())
+        _mark_ledger_deleted(tab_name, exact_line)
 
         lines.append(
             f"  {i}. {entry['original_text']}  "
@@ -606,6 +614,18 @@ def delete(n: int = 1) -> str:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _mark_ledger_deleted(tab_name: str, note_line: str) -> None:
+    """Mark the Transactions-ledger row for a deleted entry. Best effort."""
+    try:
+        from sheets import update_ledger_where  # noqa: PLC0415
+        update_ledger_where(
+            {"sheet_tab": tab_name, "note_line": note_line},
+            {"status": "deleted"},
+        )
+    except Exception as exc:
+        logger.warning(f"Could not mark ledger row deleted: {exc}")
+
 
 def _parse_currency(value: str) -> float:
     try:
